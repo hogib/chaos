@@ -12,7 +12,9 @@ from chaos.chaotic_features import (compute_corr_dim,
 FEATURE_KEYS = [
     "ham_mean", "ham_std", "ham_min", "ham_max", "aktivite_std",
     "norm_min", "norm_max",
-    "wolf_lye", "ros_short", "samp_ent", "corr_dim",
+    "wolf_lye",
+    "ros_short", "ros_r2", "ros_n_points", "ros_low_fit_quality",
+    "samp_ent", "corr_dim",
 ]
 
 
@@ -60,12 +62,16 @@ def compute_window(segment: np.ndarray, w_idx: int, cfg) -> dict:
     ros_cfg = cfg.FEATURES["rosenstein"]
     try:
         result.update(compute_lyapunov_rosenstein(
-            seg_norm, cfg.Fs,
-            tau=ros_cfg["tau"], m=ros_cfg["m"],
-            slope=ros_cfg["slope"], mean_period=ros_cfg["mean_period"],
+            seg_norm,
+            cfg.Fs,
+            mean_period=ros_cfg["mean_period"],
+            tau=ros_cfg["tau"],
+            m=ros_cfg["m"],
+            slope_ros=ros_cfg["slope"],
         ))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[rosenstein] {type(e).__name__}: {e}")
+    pass
 
     se_cfg = cfg.FEATURES["sample_entropy"]
     try:

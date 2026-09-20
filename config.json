@@ -39,8 +39,8 @@
       },
       "rosenstein": {
         "tau": 5,
-        "m": 5,
-        "slope": [0, 0.2],
+        "m": 4,
+        "slope": [0, 0.2, 5, 2],
         "mean_period": 1.0
       },
       "sample_entropy": {
