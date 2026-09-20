@@ -1,0 +1,56 @@
+{
+  "process_all": false,
+
+  "single_run": {
+    "station": "ELBA",
+    "earthquake_name": "20250423_M6.3_Silivri"
+  },
+
+  "paths": {
+    "raw_dir": "raw",
+    "processed_dir": "proceeded",
+    "results_dir": "results",
+    "results_subdir": "ENZ"
+  },
+
+  "preprocessing": {
+    "window_sec": 3600.0,
+    "freq_min": 0.1,
+    "freq_max": 2.0,
+    "gap_threshold_sec": 2.0,
+    "channels": ["E", "N", "Z"]
+  },
+
+  "feature_extraction": {
+    "fs": 5.0,
+    "win_sec": 200,
+    "step_sec": 50,
+    "prev_sec": 150,
+    "channels": ["N"],
+    "n_jobs": -1,
+    "warmup_count": 3,
+
+    "features": {
+      "wolf": {
+        "tau": 5,
+        "m": 5,
+        "evolve": 5,
+        "min_samples": 500
+      },
+      "rosenstein": {
+        "tau": 5,
+        "m": 5,
+        "slope": [0, 0.2],
+        "mean_period": 1.0
+      },
+      "sample_entropy": {
+        "m": 2,
+        "r": 0.2
+      },
+      "corr_dim": {
+        "tau": 5,
+        "m": 5
+      }
+    }
+  }
+}

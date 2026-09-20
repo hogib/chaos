@@ -1,0 +1,167 @@
+"""Entry point for the CHAOS feature-extraction pipeline.
+
+All non-derived settings (event identifiers, folder names, filter bands,
+window sizes, per-metric parameters) are read from ``config.json`` located
+next to this file. The file is re-read on every execution.
+"""
+
+import json
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+from chaos.extraction import run_feature_extraction
+from chaos.preprocess import run_mseed_preprocessing
+
+SCRIPT_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = SCRIPT_DIR / "config.json"
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict:
+    """Loads the JSON configuration file.
+
+    Args:
+        path: Path to the JSON file. Defaults to ``config.json`` next to
+            this module.
+
+    Returns:
+        Parsed configuration as a nested dictionary.
+
+    Raises:
+        FileNotFoundError: If the config file does not exist.
+        json.JSONDecodeError: If the file is not valid JSON.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+class Settings:
+    """Per-run configuration object.
+
+    Combines the project-wide config dictionary with a specific
+    ``(station, earthquake_name)`` pair. Derived quantities are computed once
+    here so downstream code never recomputes them.
+
+    Args:
+        config: Parsed project configuration (see :func:`load_config`).
+        station: Station code (e.g. ``"ELBA"``).
+        earthquake_name: Folder name identifying the earthquake event.
+    """
+
+    def __init__(self, config: dict, station: str, earthquake_name: str):
+        self._config = config
+        self.SCRIPT_DIR = SCRIPT_DIR
+
+        self.STATION = station
+        self.EARTHQUAKE_NAME = earthquake_name
+
+        paths = config["paths"]
+        self.MSEED_INPUT_DIR = (
+            self.SCRIPT_DIR / paths["raw_dir"] / station / earthquake_name
+        )
+        self.DATA_ROOT = (
+            self.SCRIPT_DIR / paths["processed_dir"] / station / earthquake_name
+        )
+        self.OUTPUT_ROOT = (
+            self.SCRIPT_DIR / paths["results_dir"] / station / earthquake_name
+            / paths["results_subdir"]
+        )
+        self.OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+        pre = config["preprocessing"]
+        self.PREPROCESS_WINDOW_SEC = float(pre["window_sec"])
+        self.FREQMIN = float(pre["freq_min"])
+        self.FREQMAX = float(pre["freq_max"])
+        self.GAP_THRESHOLD = float(pre["gap_threshold_sec"])
+        self.PREPROCESS_CHANNELS = list(pre["channels"])
+
+        fe = config["feature_extraction"]
+        self.Fs = float(fe["fs"])
+        self.WIN_SEC = float(fe["win_sec"])
+        self.STEP_SEC = float(fe["step_sec"])
+        self.PREV_SEC = float(fe["prev_sec"])
+        self.N_JOBS = int(fe["n_jobs"])
+        self.WARMUP_COUNT = int(fe["warmup_count"])
+        self.CHANNELS = list(fe["channels"])
+        self.FEATURES = fe["features"]
+
+        self.WinSize = int(self.WIN_SEC * self.Fs)
+        self.StepSize = int(self.STEP_SEC * self.Fs)
+        self.PREV_LEN = int(self.PREV_SEC * self.Fs)
+
+
+def _collect_jobs(raw_root: Path) -> list[tuple[str, str]]:
+    """Returns every ``(station, earthquake_name)`` folder pair under ``raw``.
+
+    Args:
+        raw_root: Directory containing one sub-folder per station.
+
+    Returns:
+        A list of ``(station, earthquake_name)`` tuples.
+    """
+    jobs: list[tuple[str, str]] = []
+    if not raw_root.exists():
+        return jobs
+
+    for station_dir in sorted(raw_root.iterdir()):
+        if not station_dir.is_dir():
+            continue
+        for eq_dir in sorted(station_dir.iterdir()):
+            if not eq_dir.is_dir():
+                continue
+            jobs.append((station_dir.name, eq_dir.name))
+    return jobs
+
+
+def _run_single(config: dict, station: str, earthquake_name: str,
+                n_jobs: int = -1) -> None:
+    """Runs both pipeline stages for a single station/earthquake pair.
+
+    Args:
+        config: Parsed project configuration.
+        station: Station code.
+        earthquake_name: Earthquake folder name.
+        n_jobs: Worker count used inside feature extraction. Use ``1`` when
+            jobs are already parallelised externally to avoid oversubscription.
+    """
+    cfg = Settings(config, station, earthquake_name)
+    cfg.N_JOBS = n_jobs
+    run_mseed_preprocessing(cfg)
+    run_feature_extraction(cfg)
+
+
+def main() -> None:
+    """Reads ``config.json`` and dispatches the pipeline."""
+    config = load_config()
+
+    if not config.get("process_all", False):
+        single = config["single_run"]
+        _run_single(config, single["station"], single["earthquake_name"], n_jobs=-1)
+        return
+
+    raw_root = SCRIPT_DIR / config["paths"]["raw_dir"]
+    jobs = _collect_jobs(raw_root)
+    if not jobs:
+        print(f"[WARNING] No station/earthquake folders found under {raw_root}")
+        return
+
+    print(f"[BATCH] {len(jobs)} job(s) found. Processing in parallel...\n")
+
+    cpu_count = os.cpu_count() or 1
+    max_workers = min(len(jobs), cpu_count)
+
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_run_single, config, s, e, 1): (s, e) for s, e in jobs}
+        for i, fut in enumerate(as_completed(futures), 1):
+            station, eq = futures[fut]
+            try:
+                fut.result()
+                print(f"[{i}/{len(jobs)}] OK   {station} / {eq}")
+            except Exception as exc:
+                print(f"[{i}/{len(jobs)}] FAIL {station} / {eq}: {exc}")
+
+    print(f"\n[BATCH] All {len(jobs)} job(s) completed.")
+
+
+if __name__ == "__main__":
+    main()
