@@ -12,7 +12,7 @@ Contents:
 import numpy as np
 import scipy.sparse as sp
 from scipy.spatial import cKDTree
-from scipy.spatial.distance import cdist
+from scipy.spatial.distance import cdist, pdist
 from scipy.stats import linregress
 
 
@@ -48,13 +48,14 @@ def wolf_lye_core(x, fs, tau, dim, evolve):
     Y = Y[: NPT + evolve, :]
     out = np.zeros((int(np.floor(NPT / evolve) + 1), 9), dtype=np.float64)
 
+    # Excluded candidates are marked with inf rather than nan so the searches
+    # below can use argmin, which is several times faster than nanargmin.
     Ydisti = np.sqrt(np.einsum("ij,ij->i", Y[0] - Y[:NPT], Y[0] - Y[:NPT]))
-    excl = np.arange(max(0, -10), min(NPT, 11))
-    Ydisti[Ydisti <= 0] = np.nan
-    Ydisti[excl] = np.nan
-    if np.all(np.isnan(Ydisti)):
+    Ydisti = np.where(Ydisti > 0, Ydisti, np.inf)
+    Ydisti[np.arange(max(0, -10), min(NPT, 11))] = np.inf
+    current_point_pair = int(np.argmin(Ydisti))
+    if not np.isfinite(Ydisti[current_point_pair]):
         return out, np.nan
-    current_point_pair = int(np.nanargmin(Ydisti))
 
     thbest, OUTMX, LyE = 0, SCALEMX, 0.0
     for i in range(0, NPT, evolve):
@@ -115,8 +116,7 @@ def _wolf_next_point(flag, Y, current_point, current_point_pair, NPT, evolve,
     ep = current_point + evolve
     diff = Y[ep] - Y[:NPT]
     Yd = np.sqrt(np.einsum("ij,ij->i", diff, diff))
-    excl = np.arange(max(0, ep - 10), min(NPT, ep + 11))
-    Yd[excl] = np.nan
+    Yd[np.arange(max(0, ep - 10), min(NPT, ep + 11))] = np.inf
 
     safe = current_point_pair + evolve < len(Y)
     end_v = (
@@ -134,21 +134,22 @@ def _wolf_next_point(flag, Y, current_point, current_point_pair, NPT, evolve,
     # monotone decreasing; testing the cosine avoids an arccos over every point.
     thbest = ANGLMX
     with np.errstate(invalid="ignore"):
-        pot = np.where((Yd <= 0) | (cos_t <= np.cos(ANGLMX)), np.nan, Yd)
+        pot = np.where((Yd > 0) & (cos_t > np.cos(ANGLMX)), Yd, np.inf)
     next_pt = -1
 
-    if flag == 0 and not np.all(np.isnan(pot)):
-        cand = int(np.nanargmin(pot))
+    if flag == 0:
+        cand = int(np.argmin(pot))
         if pot[cand] <= SCALEMX:
             ANGLMX = 30 * np.pi / 180
             thbest = float(np.arccos(np.clip(cos_t[cand], -1.0, 1.0)))
             next_pt = cand
 
     if next_pt == -1:
-        tmp = np.where(Yd <= 0, np.nan, Yd)
-        if np.all(np.isnan(tmp)):
+        tmp = np.where(Yd > 0, Yd, np.inf)
+        fallback = int(np.argmin(tmp))
+        if not np.isfinite(tmp[fallback]):
             return current_point_pair, ANGLMX, thbest, SCALEMX
-        next_pt = int(np.nanargmin(tmp))
+        next_pt = fallback
         thbest = ANGLMX
 
     return next_pt, ANGLMX, thbest, SCALEMX
@@ -204,8 +205,10 @@ def _mean_log_divergence(Y, neighbours):
         delta = Y[i : i + end] - Y[nn : nn + end]
         dist = np.sqrt(np.einsum("ij,ij->i", delta, delta))
         positive = dist > 0
+        # Non-positive entries are exactly 0 and log leaves them untouched, so
+        # they contribute nothing to the sum and need no extra masking pass.
         np.log(dist, out=dist, where=positive)
-        sum_log[:end] += np.where(positive, dist, 0.0)
+        sum_log[:end] += dist
         count[:end] += positive
 
     return np.divide(
@@ -297,8 +300,9 @@ def rosenstein_lye_core(x, fs, tau, dim, slope, mean_period):
 def samp_ent_core(data, m, r):
     """Computes the Sample Entropy of a signal.
 
-    Uses :func:`scipy.spatial.distance.cdist` with the Chebyshev metric rather
-    than a 3-D broadcast, which is significantly faster.
+    Uses :func:`scipy.spatial.distance.pdist`, which evaluates each unordered
+    pair once instead of filling a full square matrix. Self-matches are absent
+    by construction, so no diagonal has to be masked out.
 
     Args:
         data: Normalized signal (1-D array).
@@ -317,14 +321,14 @@ def samp_ent_core(data, m, r):
     idx = np.arange(m + 1)[np.newaxis, :] + np.arange(L)[:, np.newaxis]
     templates = data[idx]
 
-    dist_m1 = cdist(templates, templates, metric="chebyshev")
-    dist_m = cdist(templates[:, :m], templates[:, :m], metric="chebyshev")
-
-    np.fill_diagonal(dist_m, R + 1.0)
-    np.fill_diagonal(dist_m1, R + 1.0)
-
-    Bm = np.count_nonzero(dist_m <= R) / (L * L)
-    Am = np.count_nonzero(dist_m1 <= R) / (L * L)
+    # Each unordered pair is counted twice to keep the same normalisation as
+    # the ordered-pair form; the A/B ratio is unaffected either way.
+    Bm = 2 * np.count_nonzero(
+        pdist(templates[:, :m], metric="chebyshev") <= R
+    ) / (L * L)
+    Am = 2 * np.count_nonzero(
+        pdist(templates, metric="chebyshev") <= R
+    ) / (L * L)
     if Am == 0 or Bm == 0:
         return np.nan
     return float(-np.log(Am / Bm))
