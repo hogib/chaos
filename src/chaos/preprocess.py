@@ -81,6 +81,27 @@ def _save_csv_with_retry(csv_path, data, retries: int = 5, delay: float = 1.0) -
             time.sleep(delay * attempt)
 
 
+def _decimation_grid(seg_start, factor):
+    """Places a clean segment onto the window's global decimation grid.
+
+    Decimating each segment from its own first sample would put the samples
+    after a gap on a different grid than the samples before it (and than the
+    same window processed without a gap). Instead the segment is decimated
+    from its first sample whose absolute index is a multiple of ``factor``.
+
+    Args:
+        seg_start: Index of the segment's first sample within the window.
+        factor: Decimation factor.
+
+    Returns:
+        Tuple ``(phase, out_start)`` — the offset into the segment at which to
+        start taking every ``factor``-th sample, and the index in the decimated
+        output where those samples begin.
+    """
+    phase = (-seg_start) % factor
+    return phase, (seg_start + phase) // factor
+
+
 def _process_single_mseed(cfg, mseed_file, output_base) -> int:
     """Processes one MSEED file into hourly per-channel CSV files.
 
@@ -95,7 +116,7 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
         output_base: Root directory where hourly CSVs are written.
 
     Returns:
-        Number of CSV files created.
+        Tuple ``(csv_count, gap_report_lines)``.
     """
     st_full = read(str(mseed_file))
 
@@ -111,10 +132,16 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
     large_gaps = [g for g in actual_gaps if _gap_duration_sec(g, st_full) >= cfg.GAP_THRESHOLD]
     small_gaps = [g for g in actual_gaps if _gap_duration_sec(g, st_full) < cfg.GAP_THRESHOLD]
 
-    print(
-        f"  [GAP] Small (<{cfg.GAP_THRESHOLD}s): {len(small_gaps)} | "
-        f"Large (≥{cfg.GAP_THRESHOLD}s): {len(large_gaps)}"
-    )
+    gap_report = [
+        f"{mseed_file.name}: {len(small_gaps)} small (<{cfg.GAP_THRESHOLD}s), "
+        f"{len(large_gaps)} large (>={cfg.GAP_THRESHOLD}s)"
+    ]
+    for gap in large_gaps:
+        gap_report.append(
+            f"    LARGE {gap[3]} {gap[4]} -> {gap[5]} "
+            f"({_gap_duration_sec(gap, st_full):.2f}s, {gap[7]} samples)"
+        )
+    print(f"  [GAP] {gap_report[0]}")
 
     if not actual_gaps:
         st_full.merge()
@@ -177,7 +204,9 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
     for window_idx in range(num_windows):
         window_start = day_start + (window_idx * cfg.PREPROCESS_WINDOW_SEC)
         window_end = window_start + cfg.PREPROCESS_WINDOW_SEC
-        st_window = st_full.copy().slice(starttime=window_start, endtime=window_end)
+        # Stream.slice() returns views into st_full; the copy below is the
+        # only one needed, and it is window-sized rather than day-sized.
+        st_window = st_full.slice(starttime=window_start, endtime=window_end)
 
         if len(st_window) == 0 or len(st_window[0].data) < 100:
             continue
@@ -215,9 +244,10 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
             else:
                 nan_mask = win_nan_map[tr.id]
                 raw = tr.data.copy().astype(float)
-                out_n = (
-                    len(raw) // decimation_factor if decimation_factor > 1 else len(raw)
-                )
+                # obspy's decimate keeps samples 0, f, 2f, ... i.e. ceil(n / f)
+                # of them. The gapped branch must produce the same count, or
+                # channels of one window end up with different CSV lengths.
+                out_n = -(-len(raw) // decimation_factor)
                 out = np.full(out_n, np.nan, dtype=float)
 
                 pad = np.concatenate([[False], ~nan_mask, [False]])
@@ -242,12 +272,14 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
                         )
                     except Exception:
                         continue
+                    phase, out_start = _decimation_grid(
+                        seg_start, decimation_factor
+                    )
                     dec = (
-                        tmp.data[::decimation_factor]
+                        tmp.data[phase::decimation_factor]
                         if decimation_factor > 1
                         else tmp.data
                     )
-                    out_start = seg_start // decimation_factor
                     out_end = min(out_start + len(dec), out_n)
                     if out_end - out_start > 0:
                         out[out_start:out_end] = dec[: out_end - out_start]
@@ -275,13 +307,18 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
             _save_csv_with_retry(csv_path, data_out)
             total_csv_created += 1
 
-    return total_csv_created
+    return total_csv_created, gap_report
 
 
 def _process_one(args):
-    """Pickle-friendly wrapper used by :class:`ProcessPoolExecutor`."""
+    """Pickle-friendly wrapper used by :class:`ProcessPoolExecutor`.
+
+    Returns:
+        Tuple ``(file_name, csv_count, gap_report_lines)``.
+    """
     cfg, mseed_file, output_base = args
-    return mseed_file.name, _process_single_mseed(cfg, mseed_file, output_base)
+    count, gap_report = _process_single_mseed(cfg, mseed_file, output_base)
+    return mseed_file.name, count, gap_report
 
 
 def _resolve_workers(cfg, n_items: int) -> int:
@@ -327,18 +364,18 @@ def run_mseed_preprocessing(cfg) -> bool:
     log_dir = output_base / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     gap_log_path = log_dir / f"gap_report_{start_time.strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(gap_log_path, "w", encoding="utf-8") as glog:
-        glog.write(
-            f"GAP REPORT — {cfg.STATION} / {cfg.EARTHQUAKE_NAME} "
-            f"({len(mseed_files)} file(s))\n"
-        )
-        glog.write(
-            f"Target FS: {cfg.Fs} Hz | Bandpass: {cfg.FREQMIN}–{cfg.FREQMAX} Hz | "
-            f"Gap threshold: {cfg.GAP_THRESHOLD} s\n\n"
-        )
+    header = (
+        f"GAP REPORT — {cfg.STATION} / {cfg.EARTHQUAKE_NAME} "
+        f"({len(mseed_files)} file(s))\n"
+        f"Target FS: {cfg.Fs} Hz | Bandpass: {cfg.FREQMIN}–{cfg.FREQMAX} Hz | "
+        f"Gap threshold: {cfg.GAP_THRESHOLD} s\n\n"
+    )
 
     max_workers = _resolve_workers(cfg, len(mseed_files))
     total_csv_created = 0
+    # Keyed by file name so the log is ordered by input file rather than by
+    # whichever worker happened to finish first.
+    gap_lines: dict[str, list[str]] = {}
 
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         futures = {
@@ -347,11 +384,19 @@ def run_mseed_preprocessing(cfg) -> bool:
         for i, fut in enumerate(as_completed(futures), 1):
             f = futures[fut]
             try:
-                _, count = fut.result()
+                _, count, report = fut.result()
                 total_csv_created += count
+                gap_lines[f.name] = report
                 print(f"[{i}/{len(mseed_files)}] {f.name}: {count} CSV")
             except Exception as exc:
+                gap_lines[f.name] = [f"{f.name}: FAILED — {exc}"]
                 print(f"[{i}/{len(mseed_files)}] {f.name}: FAILED — {exc}")
+
+    with open(gap_log_path, "w", encoding="utf-8") as glog:
+        glog.write(header)
+        for f in mseed_files:
+            for line in gap_lines.get(f.name, [f"{f.name}: no report"]):
+                glog.write(line + "\n")
 
     print(
         f"[INFO] Preprocessing complete. "

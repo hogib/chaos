@@ -1,5 +1,5 @@
 [project]
-name = "chaos-tool"
+name = "chaos"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -12,12 +12,17 @@ dependencies = [
     "numpy>=2.5.3",
     "obspy>=1.5.1",
     "pandas>=3.0.6",
+    "pytest>=9.1.1",
     "scipy>=1.18.1",
 ]
 
 [project.scripts]
-chaos-tool = "chaos_tool:main"
+chaos = "chaos.pipeline:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

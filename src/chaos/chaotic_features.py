@@ -2,10 +2,12 @@
 
 import numpy as np
 
-from chaos.chaos_algorithms import (corrdim_core, rosenstein_lye_core,
-                                    samp_ent_core, wolf_lye_core)
+from chaos.chaos_algorithms import (corrdim_core, fit_log_divergence,
+                                    rosenstein_lye_core, samp_ent_core,
+                                    wolf_lye_core)
 
 R2_WARNING_THRESHOLD = 0.8
+MIN_FIT_POINTS = 3
 
 def compute_raw_stats(segment: np.ndarray) -> dict:
     """Computes basic statistical metrics of the raw signal.
@@ -96,25 +98,30 @@ def compute_lyapunov_wolf(
         pass
     return result
 
-def _fit_slope_with_r2(time_sec, ave_ln_div, start_s, end_s, fs):
-    """Same lo/hi rule as rosenstein_lye_core's internal fit, plus R^2 and point count."""
-    nz = int(np.count_nonzero(ave_ln_div))
-    lo = 0 if start_s == 0 else round(start_s * fs)
-    hi = round(end_s * fs)
-    if hi > nz or hi <= lo:
-        return np.nan, np.nan, 0
+def split_slope_windows(slope_ros):
+    """Splits a configured Rosenstein slope spec into its fit windows.
 
-    x = time_sec[lo:hi + 1]
-    y = ave_ln_div[lo:hi + 1]
-    if len(x) < 2:
-        return np.nan, np.nan, len(x)
+    Args:
+        slope_ros: Either ``[short_start, short_end]`` or
+            ``[short_start, short_end, long_start, long_end]``, in mean periods.
 
-    slope, intercept = np.polyfit(x, y, 1)
-    y_pred = slope * x + intercept
-    ss_res = float(np.sum((y - y_pred) ** 2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    return float(slope), r2, len(x)
+    Returns:
+        Tuple ``(short, long)`` of ``(start, end)`` pairs; ``long`` is ``None``
+        when only a short window was supplied.
+
+    Raises:
+        ValueError: If the spec does not have exactly two or four entries.
+    """
+    values = [float(v) for v in slope_ros]
+    if len(values) == 2:
+        return (values[0], values[1]), None
+    if len(values) == 4:
+        return (values[0], values[1]), (values[2], values[3])
+    raise ValueError(
+        "rosenstein slope must have 2 entries [short_start, short_end] or 4 "
+        f"entries [short_start, short_end, long_start, long_end]; got {values}"
+    )
+
 
 def compute_lyapunov_rosenstein(
     segment: np.ndarray,
@@ -124,13 +131,18 @@ def compute_lyapunov_rosenstein(
     m: int = 4,
     slope_ros: list | None = None,
 ) -> dict:
-    """Short-term Lyapunov exponent via Rosenstein, with fit quality.
+    """Short- and long-term Lyapunov exponents via Rosenstein, with fit quality.
 
-    The primary output key is ``ros_short`` so it flows directly into the
-    feature CSV (which filters rows through ``FEATURE_KEYS``). Extra keys
-    ``ros_r2``, ``ros_n_points`` and ``ros_low_fit_quality`` are also returned
-    — add them to ``FEATURE_KEYS`` in ``chaos/extraction.py`` if you want them
-    written to disk.
+    The divergence curve is computed once and then fitted over each configured
+    window. Both windows are expressed in *mean periods*, matching
+    :func:`chaos.chaos_algorithms.fit_log_divergence`, so the exponents are in
+    units of 1/period.
+
+    ``ros_low_fit_quality`` is set when the short-window fit rests on fewer
+    than :data:`MIN_FIT_POINTS` samples or when its R-squared falls below
+    :data:`R2_WARNING_THRESHOLD`. A two-point window always reports
+    R-squared 1.0 — that is an artefact of fitting a line through two points,
+    not a good fit, hence the separate point-count check.
 
     Args:
         segment: Normalized signal (1-D ndarray).
@@ -139,39 +151,55 @@ def compute_lyapunov_rosenstein(
             in seconds.
         tau: Time delay.
         m: Embedding dimension.
-        slope_ros: ``[short_start_s, short_end_s]`` fit window in seconds.
+        slope_ros: Fit windows in mean periods; see
+            :func:`split_slope_windows`.
 
     Returns:
-        Dictionary with keys ``ros_short``, ``ros_r2``, ``ros_n_points`` and
-        ``ros_low_fit_quality``.
+        Dictionary with keys ``ros_short``, ``ros_r2``, ``ros_n_points``,
+        ``ros_low_fit_quality``, ``ros_long``, ``ros_long_r2`` and
+        ``ros_long_n_points``.
     """
     if slope_ros is None:
         slope_ros = [0.2, 4.0]
+    short_window, long_window = split_slope_windows(slope_ros)
 
     result = {
         "ros_short": np.nan,
         "ros_r2": np.nan,
         "ros_n_points": 0,
         "ros_low_fit_quality": False,
+        "ros_long": np.nan,
+        "ros_long_r2": np.nan,
+        "ros_long_n_points": 0,
     }
     try:
         _, out_matrix = rosenstein_lye_core(
             segment, fs, tau, m, slope_ros, mean_period
         )
         ave_ln_div = out_matrix[2]
-        time_sec = np.arange(len(ave_ln_div)) / fs
-        lye, r2, n_points = _fit_slope_with_r2(
-            time_sec, ave_ln_div, slope_ros[0], slope_ros[1], fs
+
+        lye, r2, n_points = fit_log_divergence(
+            ave_ln_div, fs, mean_period, *short_window
         )
         result["ros_short"] = round(lye, 5) if np.isfinite(lye) else np.nan
         result["ros_r2"] = round(r2, 5) if np.isfinite(r2) else np.nan
         result["ros_n_points"] = n_points
         result["ros_low_fit_quality"] = bool(
-            np.isfinite(r2) and r2 < R2_WARNING_THRESHOLD
+            n_points < MIN_FIT_POINTS
+            or (np.isfinite(r2) and r2 < R2_WARNING_THRESHOLD)
         )
+
+        if long_window is not None:
+            lye_l, r2_l, n_l = fit_log_divergence(
+                ave_ln_div, fs, mean_period, *long_window
+            )
+            result["ros_long"] = round(lye_l, 5) if np.isfinite(lye_l) else np.nan
+            result["ros_long_r2"] = round(r2_l, 5) if np.isfinite(r2_l) else np.nan
+            result["ros_long_n_points"] = n_l
     except Exception as e:
         print(f"[rosenstein] {type(e).__name__}: {e}")
     return result
+
 
 def compute_sample_entropy(
     segment: np.ndarray,

@@ -5,12 +5,11 @@ Adapted from S. Sarwar, A. Likens, N. Stergiou, S. Mastorakis,
 arXiv:2311.06723 (2023), https://arxiv.org/abs/2311.06723
 
 Contents:
-    wolf_lye_core, rosenstein_lye_core, samp_ent_core, corrdim_core,
-    fnn_core, ami_core.
+    wolf_lye_core, rosenstein_lye_core, fit_log_divergence, samp_ent_core,
+    corrdim_core, fnn_core, ami_core.
 """
 
 import numpy as np
-import numpy.polynomial.polynomial as _poly
 import scipy.sparse as sp
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import cdist
@@ -39,18 +38,22 @@ def wolf_lye_core(x, fs, tau, dim, evolve):
 
     N = len(x)
     M = N - (dim - 1) * tau
+    NPT = M - evolve
+    if NPT < 1:
+        return np.zeros((0, 9), dtype=np.float64), np.nan
+
     Y = np.empty((M, dim), dtype=np.float64)
     for i in range(dim):
         Y[:, i] = x[i * tau: M + i * tau]
-
-    NPT = N - (dim - 1) * tau - evolve
     Y = Y[: NPT + evolve, :]
-    out = np.zeros((int(np.floor(NPT / evolve) + 1), 9), dtype=object)
+    out = np.zeros((int(np.floor(NPT / evolve) + 1), 9), dtype=np.float64)
 
-    Ydisti = np.sqrt(np.sum((Y[0] - Y[:NPT]) ** 2, axis=1))
+    Ydisti = np.sqrt(np.einsum("ij,ij->i", Y[0] - Y[:NPT], Y[0] - Y[:NPT]))
     excl = np.arange(max(0, -10), min(NPT, 11))
     Ydisti[Ydisti <= 0] = np.nan
     Ydisti[excl] = np.nan
+    if np.all(np.isnan(Ydisti)):
+        return out, np.nan
     current_point_pair = int(np.nanargmin(Ydisti))
 
     thbest, OUTMX, LyE = 0, SCALEMX, 0.0
@@ -64,9 +67,13 @@ def wolf_lye_core(x, fs, tau, dim, evolve):
         start_dist = np.linalg.norm(Y[i] - Y[current_point_pair])
         end_dist = np.linalg.norm(Y[ep] - Y[pair_ep])
 
-        distSUM += np.log2(end_dist / start_dist) / (evolve * DT)
-        ITS += 1
-        LyE = distSUM / ITS
+        # A zero separation at either end makes log2(end/start) infinite and
+        # would poison the running mean for every remaining step, so the step
+        # is skipped rather than accumulated.
+        if start_dist > 0 and end_dist > 0:
+            distSUM += np.log2(end_dist / start_dist) / (evolve * DT)
+            ITS += 1
+            LyE = distSUM / ITS
         out[int(np.floor(i / evolve))] = [
             ITS, i, current_point_pair, start_dist, end_dist, LyE, OUTMX,
             thbest * 180 / np.pi, ANGLMX * 180 / np.pi,
@@ -107,7 +114,7 @@ def _wolf_next_point(flag, Y, current_point, current_point_pair, NPT, evolve,
     """
     ep = current_point + evolve
     diff = Y[ep] - Y[:NPT]
-    Yd = np.sqrt(np.sum(diff ** 2, axis=1))
+    Yd = np.sqrt(np.einsum("ij,ij->i", diff, diff))
     excl = np.arange(max(0, ep - 10), min(NPT, ep + 11))
     Yd[excl] = np.nan
 
@@ -121,44 +128,146 @@ def _wolf_next_point(flag, Y, current_point, current_point_pair, NPT, evolve,
     end_dist = np.linalg.norm(Vcurr)
 
     with np.errstate(invalid="ignore", divide="ignore"):
-        cos_t = np.abs(np.sum(Vcurr * diff, axis=1) / (Yd * end_dist))
-        theta = np.arccos(np.clip(cos_t, -1.0, 1.0))
+        cos_t = np.abs(diff @ Vcurr / (Yd * end_dist))
 
+    # theta >= ANGLMX is equivalent to cos_t <= cos(ANGLMX) since arccos is
+    # monotone decreasing; testing the cosine avoids an arccos over every point.
     thbest = ANGLMX
-    pot = np.where((Yd <= 0) | (theta >= ANGLMX), np.nan, Yd)
+    with np.errstate(invalid="ignore"):
+        pot = np.where((Yd <= 0) | (cos_t <= np.cos(ANGLMX)), np.nan, Yd)
     next_pt = -1
 
-    if flag == 0:
-        order = np.argsort(np.where(np.isnan(pot), np.inf, pot))
-        cand = int(order[0])
-        if not np.isnan(pot[cand]) and pot[cand] <= SCALEMX:
+    if flag == 0 and not np.all(np.isnan(pot)):
+        cand = int(np.nanargmin(pot))
+        if pot[cand] <= SCALEMX:
             ANGLMX = 30 * np.pi / 180
-            thbest = float(np.abs(theta[cand]))
+            thbest = float(np.arccos(np.clip(cos_t[cand], -1.0, 1.0)))
             next_pt = cand
-        else:
-            flag = 1
 
     if next_pt == -1:
         tmp = np.where(Yd <= 0, np.nan, Yd)
+        if np.all(np.isnan(tmp)):
+            return current_point_pair, ANGLMX, thbest, SCALEMX
         next_pt = int(np.nanargmin(tmp))
         thbest = ANGLMX
 
     return next_pt, ANGLMX, thbest, SCALEMX
 
 
+def _nearest_neighbours(Y, band):
+    """Finds, for every point, its nearest neighbour outside a Theiler band.
+
+    Args:
+        Y: Embedded trajectory, shape ``(M, dim)``.
+        band: Minimum index separation ``|i - j|`` a neighbour must exceed.
+
+    Returns:
+        Integer array of length ``M`` holding the neighbour index of each point.
+    """
+    M = Y.shape[0]
+    # At most 2*band+1 candidates can be rejected by the band, so asking for
+    # one more than that guarantees a valid neighbour is in the result set.
+    k = min(M, 2 * band + 2)
+    _, idx = cKDTree(Y).query(Y, k=k)
+    idx = np.asarray(idx).reshape(M, -1)
+
+    rows = np.arange(M)
+    outside = np.abs(idx - rows[:, np.newaxis]) > band
+    first = outside.argmax(axis=1)
+    first[~outside.any(axis=1)] = 0
+    return idx[rows, first].astype(np.int64)
+
+
+def _mean_log_divergence(Y, neighbours):
+    """Averages ``log`` of the neighbour separation over all trajectory pairs.
+
+    Equivalent to building the full ``(M, M)`` divergence matrix and taking the
+    row means of its positive entries, but accumulates in ``O(M)`` memory.
+
+    Args:
+        Y: Embedded trajectory, shape ``(M, dim)``.
+        neighbours: Nearest-neighbour index per point (see
+            :func:`_nearest_neighbours`).
+
+    Returns:
+        Array of length ``M`` with the mean log divergence at each step.
+    """
+    M = Y.shape[0]
+    sum_log = np.zeros(M, dtype=np.float64)
+    count = np.zeros(M, dtype=np.int64)
+
+    for i in range(M):
+        nn = int(neighbours[i])
+        end = min(M - i, M - nn)
+        if end <= 0:
+            continue
+        delta = Y[i : i + end] - Y[nn : nn + end]
+        dist = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        positive = dist > 0
+        np.log(dist, out=dist, where=positive)
+        sum_log[:end] += np.where(positive, dist, 0.0)
+        count[:end] += positive
+
+    return np.divide(
+        sum_log, count, out=np.zeros(M, dtype=np.float64), where=count > 0
+    )
+
+
+def fit_log_divergence(ave_ln_div, fs, mean_period, start, end):
+    """Least-squares slope of the mean log-divergence curve.
+
+    This is the single definition of the Rosenstein fit window used by both
+    :func:`rosenstein_lye_core` and the per-window wrapper, so the two cannot
+    drift apart. ``start`` and ``end`` are expressed in *mean periods*, and the
+    returned slope is therefore in units of 1/period.
+
+    Args:
+        ave_ln_div: Mean log-divergence curve (1-D array).
+        fs: Sampling frequency in Hz.
+        mean_period: Reciprocal of the dominant frequency in seconds.
+        start: Fit-window start, in mean periods.
+        end: Fit-window end, in mean periods.
+
+    Returns:
+        Tuple ``(slope, r_squared, n_points)``. ``slope`` and ``r_squared`` are
+        ``nan`` and ``n_points`` is ``0`` when the window is unusable.
+    """
+    ave = np.asarray(ave_ln_div, dtype=np.float64).ravel()
+    nz = int(np.count_nonzero(ave))
+
+    lo = int(round(start * mean_period * fs))
+    hi = int(round(end * mean_period * fs))
+    if lo < 0 or hi <= lo or hi > nz:
+        return np.nan, np.nan, 0
+
+    t = np.arange(lo, hi + 1, dtype=np.float64) / fs / mean_period
+    y = ave[lo : hi + 1]
+    if t.size < 2:
+        return np.nan, np.nan, int(t.size)
+
+    slope, intercept = np.polyfit(t, y, 1)
+    resid = y - (slope * t + intercept)
+    centered = y - y.mean()
+    ss_tot = float(centered @ centered)
+    r2 = 1.0 - float(resid @ resid) / ss_tot if ss_tot > 0 else np.nan
+    return float(slope), r2, int(t.size)
+
+
 def rosenstein_lye_core(x, fs, tau, dim, slope, mean_period):
     """Computes the short-term Lyapunov exponent via Rosenstein (1993).
 
-    Nearest neighbours are found with a :class:`scipy.spatial.cKDTree`
-    query instead of a dense distance matrix, which is much faster for
-    moderately long signals.
+    Nearest neighbours come from a :class:`scipy.spatial.cKDTree` query rather
+    than a dense distance matrix, and the divergence curve is accumulated in
+    linear memory instead of an ``(M, M)`` matrix.
 
     Args:
         x: Normalized signal (1-D array).
         fs: Sampling frequency in Hz.
         tau: Time delay.
         dim: Embedding dimension.
-        slope: Slope window ``[short_start, short_end]`` in periods.
+        slope: Fit window in mean periods. Either ``[short_start, short_end]``
+            or ``[short_start, short_end, long_start, long_end]``; only the
+            short window is used here.
         mean_period: Reciprocal of the dominant frequency in seconds.
 
     Returns:
@@ -166,57 +275,22 @@ def rosenstein_lye_core(x, fs, tau, dim, slope, mean_period):
         ``[index, nearest_neighbour_index, average_log_divergence]``.
     """
     x = np.asarray(x, dtype=np.float64).ravel()
-    N = len(x)
+    N = x.size
     M = N - (dim - 1) * tau
+    if M < 2:
+        return [np.nan, np.zeros((3, 0), dtype=np.float64)]
+
     Y = np.empty((M, dim), dtype=np.float64)
     for j in range(dim):
-        Y[:, j] = x[j * tau: M + j * tau]
+        Y[:, j] = x[j * tau : M + j * tau]
 
-    band = (dim - 1) * tau
-    k_query = min(M, 2 * band + 2)
-    tree = cKDTree(Y)
-    _, idx = tree.query(Y, k=k_query)
-    if idx.ndim == 1:
-        idx = idx[:, np.newaxis]
+    neighbours = _nearest_neighbours(Y, band=(dim - 1) * tau)
+    ave_ln_div = _mean_log_divergence(Y, neighbours)
 
-    IND2 = np.empty(M, dtype=np.int64)
-    for i in range(M):
-        row = idx[i]
-        valid = np.abs(row - i) > band
-        IND2[i] = row[int(np.argmax(valid))] if valid.any() else row[0]
-
-    DM = np.zeros((M, M), dtype=np.float64)
-    for i in range(M):
-        nn = IND2[i]
-        end = min(M - i, M - nn)
-        if end > 0:
-            DM[:end, i] = np.sqrt(
-                np.sum((Y[i : i + end] - Y[nn : nn + end]) ** 2, axis=1)
-            )
-
-    AveLnDiv = np.zeros(M, dtype=np.float64)
-    for i in range(M):
-        pos = DM[i, DM[i, :] > 0]
-        if len(pos):
-            AveLnDiv[i] = np.mean(np.log(pos))
-
-    time = np.arange(len(AveLnDiv)) / fs / mean_period
-    nz = int(np.count_nonzero(AveLnDiv))
-
-    def _fit(lo, hi):
-        if hi <= nz:
-            c = _poly.polyfit(time[lo : hi + 1], AveLnDiv[lo : hi + 1], 1)
-            return float(c[1])
-        return np.nan
-
-    sL = [
-        0 if slope[0] == 0 else round(slope[0] * mean_period * fs),
-        round(slope[1] * mean_period * fs),
-    ]
-
+    lye, _, _ = fit_log_divergence(ave_ln_div, fs, mean_period, slope[0], slope[1])
     return [
-        _fit(sL[0], sL[1]),
-        np.vstack((np.arange(M), IND2, AveLnDiv)),
+        lye,
+        np.vstack((np.arange(M, dtype=np.float64), neighbours, ave_ln_div)),
     ]
 
 
@@ -235,8 +309,11 @@ def samp_ent_core(data, m, r):
         Sample entropy (float) or ``nan`` if it cannot be computed.
     """
     data = np.asarray(data, dtype=np.float64).ravel()
-    R = r * np.std(data, ddof=1)
     L = len(data) - m
+    if L < 2:
+        return np.nan
+
+    R = r * np.std(data, ddof=1)
     idx = np.arange(m + 1)[np.newaxis, :] + np.arange(L)[:, np.newaxis]
     templates = data[idx]
 
@@ -246,8 +323,8 @@ def samp_ent_core(data, m, r):
     np.fill_diagonal(dist_m, R + 1.0)
     np.fill_diagonal(dist_m1, R + 1.0)
 
-    Bm = (dist_m <= R).sum() / (L * L)
-    Am = (dist_m1 <= R).sum() / (L * L)
+    Bm = np.count_nonzero(dist_m <= R) / (L * L)
+    Am = np.count_nonzero(dist_m1 <= R) / (L * L)
     if Am == 0 or Bm == 0:
         return np.nan
     return float(-np.log(Am / Bm))
@@ -256,16 +333,13 @@ def samp_ent_core(data, m, r):
 def corrdim_core(x, tau, de):
     """Computes the correlation dimension of a signal.
 
-    The pairwise distance matrix is built once with :func:`scipy.spatial.distance.cdist`
-    instead of recomputing it twice in Python loops.
-
     Args:
         x: Normalized signal (1-D array).
         tau: Time delay.
         de: Embedding dimension.
 
     Returns:
-        Correlation dimension (slope of the log–log correlation integral).
+        Correlation dimension (slope of the log-log correlation integral).
     """
     x = np.asarray(x, dtype=np.float64).ravel()
     N = len(x)
@@ -282,13 +356,30 @@ def corrdim_core(x, tau, de):
     if D.size == 0:
         return 0.0
 
-    eps1 = float(D.max())
-    eps2 = float(D.min())
-    if eps2 == 0:
-        eps2 = np.finfo(float).eps
+    # D is not needed afterwards, so sort the underlying buffer in place and
+    # skip an extra full-size copy. Sorting first also makes the radius range
+    # below a pair of lookups rather than two more passes over the matrix.
+    flat_sorted = D.reshape(-1)
+    flat_sorted.sort()
+
+    eps1 = float(flat_sorted[-1])
+    # A degenerate (constant) signal collapses every pairwise distance to zero;
+    # there is no log-log range to fit and log(0) would warn on every window.
+    if not np.isfinite(eps1) or eps1 <= 0:
+        return 0.0
+
+    # The blocks compared above overlap, so some pairs are a point against
+    # itself and the minimum distance is always exactly 0. Falling back to
+    # machine epsilon there would anchor the radius grid to an absolute
+    # constant instead of the data, leaving almost every bin below the
+    # smallest real distance (and making the result depend on the signal's
+    # units). The floor is the smallest *positive* distance instead.
+    first_positive = int(np.searchsorted(flat_sorted, 0.0, side="right"))
+    if first_positive >= flat_sorted.size:
+        return 0.0
+    eps2 = float(flat_sorted[first_positive])
 
     epsilon = np.exp(np.linspace(np.log(eps2), np.log(eps1), bins))
-    flat_sorted = np.sort(D.ravel())
     cumCI = np.searchsorted(flat_sorted, epsilon, side="right").astype(float)
 
     denom = (n - k) ** 2

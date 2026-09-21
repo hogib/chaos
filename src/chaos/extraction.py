@@ -14,6 +14,7 @@ FEATURE_KEYS = [
     "norm_min", "norm_max",
     "wolf_lye",
     "ros_short", "ros_r2", "ros_n_points", "ros_low_fit_quality",
+    "ros_long", "ros_long_r2", "ros_long_n_points",
     "samp_ent", "corr_dim",
 ]
 
@@ -71,7 +72,6 @@ def compute_window(segment: np.ndarray, w_idx: int, cfg) -> dict:
         ))
     except Exception as e:
         print(f"[rosenstein] {type(e).__name__}: {e}")
-    pass
 
     se_cfg = cfg.FEATURES["sample_entropy"]
     try:
@@ -135,121 +135,134 @@ def run_feature_extraction(cfg) -> None:
     prev_data = {ch: np.array([]) for ch in channels}
     is_first_file = True
 
-    for d_idx, date_dir in enumerate(date_folders):
-        ref_dir = None
-        for ch in channels:
-            ch_dir = date_dir / ch
-            if ch_dir.exists() and any(ch_dir.glob("*.csv")):
-                ref_dir = ch_dir
-                break
-
-        if ref_dir is None:
-            continue
-
-        csv_files = sorted(ref_dir.glob("*.csv"))
-        date_name = date_dir.name
-        print(
-            f"[{d_idx + 1}/{len(date_folders)}] Date: {date_name}  "
-            f"({len(csv_files)} files)"
-        )
-
-        for f_idx, ref_csv in enumerate(csv_files):
-            timestamp = ref_csv.stem.rsplit("_", 1)[0]
-            print(
-                f"  [{f_idx + 1}/{len(csv_files)}] {ref_csv.name}... ",
-                end="", flush=True,
-            )
-
-            raw = {}
-            ref_len = None
+    # A single pool for the whole run: joblib reuses its workers across
+    # every `parallel(...)` call inside the context, instead of spawning
+    # and tearing down a process pool once per file and per channel.
+    with Parallel(n_jobs=cfg.N_JOBS, prefer="processes") as parallel:
+        for d_idx, date_dir in enumerate(date_folders):
+            ref_dir = None
             for ch in channels:
-                ch_path = date_dir / ch / f"{timestamp}_{ch}.csv"
-                try:
-                    df = pd.read_csv(str(ch_path), header=None)
-                    arr = df.iloc[:, 0].to_numpy(dtype=float)
-                    raw[ch] = arr
-                    ref_len = len(arr)
-                except Exception:
-                    raw[ch] = None
+                ch_dir = date_dir / ch
+                if ch_dir.exists() and any(ch_dir.glob("*.csv")):
+                    ref_dir = ch_dir
+                    break
 
-            if ref_len is None:
-                print("ERROR (all channels failed to load)")
+            if ref_dir is None:
                 continue
 
-            for ch in channels:
-                if raw[ch] is None:
-                    raw[ch] = np.full(ref_len, np.nan)
+            csv_files = sorted(ref_dir.glob("*.csv"))
+            date_name = date_dir.name
+            print(
+                f"[{d_idx + 1}/{len(date_folders)}] Date: {date_name}  "
+                f"({len(csv_files)} files)"
+            )
 
-            x_total = {}
-            for ch in channels:
-                x_total[ch] = (
-                    np.concatenate([prev_data[ch], raw[ch]])
-                    if len(prev_data[ch]) > 0
-                    else raw[ch].copy()
+            for f_idx, ref_csv in enumerate(csv_files):
+                timestamp = ref_csv.stem.rsplit("_", 1)[0]
+                print(
+                    f"  [{f_idx + 1}/{len(csv_files)}] {ref_csv.name}... ",
+                    end="", flush=True,
                 )
 
-            n_total = len(x_total[channels[0]])
-            num_windows = max(0, (n_total - cfg.WinSize) // cfg.StepSize + 1)
+                raw = {}
+                ref_len = None
+                for ch in channels:
+                    ch_path = date_dir / ch / f"{timestamp}_{ch}.csv"
+                    try:
+                        df = pd.read_csv(
+                            ch_path, header=None, usecols=[0], dtype=np.float64
+                        )
+                        arr = df.iloc[:, 0].to_numpy(dtype=np.float64)
+                        raw[ch] = arr
+                        ref_len = len(arr)
+                    except Exception:
+                        raw[ch] = None
 
-            if num_windows == 0:
-                print(f"WARNING: insufficient data ({n_total} samples)")
+                if ref_len is None:
+                    print("ERROR (all channels failed to load)")
+                    continue
+
+                for ch in channels:
+                    if raw[ch] is None:
+                        raw[ch] = np.full(ref_len, np.nan)
+
+                x_total = {}
+                for ch in channels:
+                    x_total[ch] = (
+                        np.concatenate([prev_data[ch], raw[ch]])
+                        if len(prev_data[ch]) > 0
+                        else raw[ch].copy()
+                    )
+
+                n_total = len(x_total[channels[0]])
+                num_windows = max(0, (n_total - cfg.WinSize) // cfg.StepSize + 1)
+
+                if num_windows == 0:
+                    print(f"WARNING: insufficient data ({n_total} samples)")
+                    for ch in channels:
+                        n_t = len(x_total[ch])
+                        prev_data[ch] = (
+                            x_total[ch][-cfg.PREV_LEN:].copy()
+                            if n_t >= cfg.PREV_LEN
+                            else x_total[ch].copy()
+                        )
+                    continue
+
+                starts = np.arange(num_windows) * cfg.StepSize
+                ends = starts + cfg.WinSize
+                time_stamps = ends / cfg.Fs / 60.0
+                hour_num = _extract_hour(ref_csv.stem)
+
+                skip_count = (
+                    min(cfg.WARMUP_COUNT, num_windows)
+                    if is_first_file and cfg.WARMUP_COUNT > 0
+                    else 0
+                )
+
+                # One dispatch for every (channel, window) pair of this file. The
+                # pool itself lives for the whole run (see `parallel` below), so
+                # workers are not respawned per file or per channel.
+                tasks = [
+                    delayed(compute_window)(x_total[ch][s:e], skip_count + w, cfg)
+                    for ch in channels
+                    for w, (s, e) in enumerate(
+                        zip(starts[skip_count:], ends[skip_count:])
+                    )
+                ]
+                flat = parallel(tasks)
+                per_channel = num_windows - skip_count
+                ch_results = {
+                    ch: flat[i * per_channel: (i + 1) * per_channel]
+                    for i, ch in enumerate(channels)
+                }
+
+                for w in range(num_windows):
+                    row = {
+                        "Window_ID": f"{date_name}_{hour_num:02d}_w{w + 1:02d}",
+                        "Time_min": round(float(time_stamps[w]), 3),
+                    }
+                    if w < skip_count:
+                        for ch in channels:
+                            for key in FEATURE_KEYS:
+                                row[f"{ch}_{key}"] = np.nan
+                    else:
+                        res_idx = w - skip_count
+                        for ch in channels:
+                            res = ch_results[ch][res_idx]
+                            for key in FEATURE_KEYS:
+                                row[f"{ch}_{key}"] = res.get(key, np.nan)
+                    csv_rows.append(row)
+
                 for ch in channels:
                     n_t = len(x_total[ch])
                     prev_data[ch] = (
-                        x_total[ch][-cfg.PREV_LEN:]
+                        x_total[ch][-cfg.PREV_LEN:].copy()
                         if n_t >= cfg.PREV_LEN
-                        else x_total[ch]
+                        else x_total[ch].copy()
                     )
-                continue
 
-            starts = np.arange(num_windows) * cfg.StepSize
-            ends = starts + cfg.WinSize
-            time_stamps = ends / cfg.Fs / 60.0
-            hour_num = _extract_hour(ref_csv.stem)
-
-            skip_count = (
-                min(cfg.WARMUP_COUNT, num_windows)
-                if is_first_file and cfg.WARMUP_COUNT > 0
-                else 0
-            )
-
-            ch_results: dict[str, list] = {}
-            for ch in channels:
-                segs = [x_total[ch][s:e] for s, e in zip(starts[skip_count:], ends[skip_count:])]
-                ch_results[ch] = list(
-                    Parallel(n_jobs=cfg.N_JOBS, prefer="processes")(
-                        delayed(compute_window)(seg, skip_count + w, cfg)
-                        for w, seg in enumerate(segs)
-                    )
-                )
-
-            for w in range(num_windows):
-                row = {
-                    "Window_ID": f"{date_name}_{hour_num:02d}_w{w + 1:02d}",
-                    "Time_min": round(float(time_stamps[w]), 3),
-                }
-                if w < skip_count:
-                    for ch in channels:
-                        for key in FEATURE_KEYS:
-                            row[f"{ch}_{key}"] = np.nan
-                else:
-                    res_idx = w - skip_count
-                    for ch in channels:
-                        res = ch_results[ch][res_idx]
-                        for key in FEATURE_KEYS:
-                            row[f"{ch}_{key}"] = res.get(key, np.nan)
-                csv_rows.append(row)
-
-            for ch in channels:
-                n_t = len(x_total[ch])
-                prev_data[ch] = (
-                    x_total[ch][-cfg.PREV_LEN:]
-                    if n_t >= cfg.PREV_LEN
-                    else x_total[ch].copy()
-                )
-
-            print(f"OK ({num_windows} windows)")
-            is_first_file = False
+                print(f"OK ({num_windows} windows)")
+                is_first_file = False
 
     if not csv_rows:
         print("\n[WARNING] No data to save.")
