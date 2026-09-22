@@ -344,3 +344,67 @@ def test_corrdim_invariant_to_scaling(synthetic_segment):
     a = corrdim_core(synthetic_segment, tau=5, de=5)
     b = corrdim_core(synthetic_segment * 1000.0, tau=5, de=5)
     assert a == pytest.approx(b, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Degenerate-input robustness
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("n", [0, 1, 2, 5, 16])
+def test_corrdim_returns_a_number_on_too_short_input(n):
+    """Regression: n = len(x) - (de-1)*tau went negative and np.zeros raised
+    ValueError('negative dimensions are not allowed')."""
+    x = np.arange(n, dtype=float)
+    assert corrdim_core(x, tau=5, de=5) == 0.0
+
+
+@pytest.mark.parametrize("fn", [
+    lambda x: wolf_lye_core(x, 5.0, 5, 5, 5),
+    lambda x: rosenstein_lye_core(x, 5.0, 5, 5, [0, 1, 4, 10], 1.0),
+    lambda x: samp_ent_core(x, 2, 0.2),
+    lambda x: corrdim_core(x, 5, 5),
+])
+@pytest.mark.parametrize("name", ["const", "two_valued", "spike", "huge"])
+def test_cores_emit_no_numpy_warnings(fn, name):
+    """A RuntimeWarning here means a log(0) or 0/0 slipped into a feature."""
+    rng = np.random.RandomState(11)
+    data = {
+        "const": np.ones(600),
+        "two_valued": np.tile([0.0, 1.0], 300),
+        "spike": np.r_[np.zeros(599), 1e9],
+        "huge": rng.randn(600) * 1e12,
+    }[name]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        fn(data)
+
+
+# ---------------------------------------------------------------------------
+# fit_log_divergence — the trailing zero run is not data
+# ---------------------------------------------------------------------------
+
+def test_fit_ignores_trailing_zero_run():
+    """The divergence curve ends in exact zeros: those are steps where no
+    trajectory pair is still in range, not measurements of zero divergence.
+    Fitting into them drags the slope toward zero."""
+    from chaos.chaos_algorithms import fit_log_divergence
+
+    curve = np.concatenate([np.arange(1, 11, dtype=float), np.zeros(10)])
+    # Window 0..9 lies entirely inside the real data.
+    slope, r2, n = fit_log_divergence(curve, 1.0, 1.0, 0.0, 9.0)
+    assert n == 10 and slope == pytest.approx(1.0)
+    # Window 0..10 would read the first padding zero.
+    assert fit_log_divergence(curve, 1.0, 1.0, 0.0, 10.0)[2] == 0
+
+
+def test_rosenstein_curve_ends_in_zeros(synthetic_segment, sample_rate):
+    """Documents the shape fit_log_divergence has to defend against."""
+    _, out = rosenstein_lye_core(
+        synthetic_segment, sample_rate, 5, 5, [0, 1, 4, 10], 1.0
+    )
+    curve = out[2]
+    zeros = np.flatnonzero(curve == 0)
+    assert zeros.size > 0
+    assert np.array_equal(zeros, np.arange(zeros[0], curve.size)), (
+        "zeros must form one contiguous tail"
+    )

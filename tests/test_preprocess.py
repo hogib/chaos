@@ -152,15 +152,71 @@ def test_process_single_mseed_folder_layout(preprocess_cfg, synthetic_mseed):
 
 def test_process_single_mseed_decimates_to_target_fs(preprocess_cfg,
                                                      synthetic_mseed):
-    """100 Hz in, Fs=5 Hz out: one hour must land on 3600*5 samples (+1 for the
-    inclusive slice endpoint)."""
+    """100 Hz in, Fs=5 Hz out: one hour must land on exactly 3600*5 samples."""
     _process_single_mseed(preprocess_cfg, synthetic_mseed,
                           preprocess_cfg.DATA_ROOT)
     data = np.loadtxt(
         preprocess_cfg.DATA_ROOT / "2020_01_24" / "N" / "20200124_000000_N.csv",
         delimiter=",",
     )
-    assert abs(len(data) - 3600 * preprocess_cfg.Fs) <= 1
+    assert len(data) == 3600 * preprocess_cfg.Fs
+
+
+def test_process_single_mseed_hours_do_not_overlap(preprocess_cfg,
+                                                   synthetic_mseed):
+    """Regression: the hourly slice used an inclusive endtime, so every hour
+    carried a copy of the next hour's first sample. That is one duplicated
+    sample per hour, and it slid stage 2's window grid a sample further out of
+    step with wall-clock time with every file."""
+    _process_single_mseed(preprocess_cfg, synthetic_mseed,
+                          preprocess_cfg.DATA_ROOT)
+    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
+    first = np.loadtxt(day / "N" / "20200124_000000_N.csv", delimiter=",")
+    second = np.loadtxt(day / "N" / "20200124_010000_N.csv", delimiter=",")
+
+    assert len(first) == len(second) == 3600 * preprocess_cfg.Fs
+    # The boundary sample belongs to the second hour and to it alone.
+    assert first[-1] != second[0]
+
+
+def test_process_single_mseed_covers_data_past_midnight(preprocess_cfg,
+                                                        tmp_path):
+    """Regression: the window grid was clipped to the calendar day parsed out
+    of the file name, so a file that ran past midnight had every later sample
+    silently dropped -- 30 hours in, 2 hours out."""
+    from obspy import Stream, UTCDateTime
+
+    from conftest import RAW_FS, _trace
+
+    npts = int(30 * 3600 * RAW_FS)
+    t = np.arange(npts) / RAW_FS
+    data = 1000.0 * np.sin(2 * np.pi * 0.5 * t)
+    start = UTCDateTime("2020-01-24T22:00:00")
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    path = raw_dir / "XX_TEST__24012020_220000_long.mseed"
+    Stream([_trace(c, data, start) for c in ("E", "N", "Z")]).write(
+        str(path), format="MSEED"
+    )
+
+    count, _ = _process_single_mseed(preprocess_cfg, path,
+                                     preprocess_cfg.DATA_ROOT)
+    assert count == 30 * 3, "every hour of the file must be written"
+    days = {p.parent.parent.name for p in _csvs(preprocess_cfg.DATA_ROOT)}
+    assert days == {"2020_01_24", "2020_01_25", "2020_01_26"}
+
+
+def test_process_single_mseed_honours_configured_channels(preprocess_cfg,
+                                                          synthetic_mseed):
+    """Regression: preprocessing.channels was read into Settings and then
+    ignored -- the component loop was hard-coded to E, N, Z."""
+    preprocess_cfg.PREPROCESS_CHANNELS = ["N"]
+    count, _ = _process_single_mseed(preprocess_cfg, synthetic_mseed,
+                                     preprocess_cfg.DATA_ROOT)
+    assert count == 2  # two hours, one component
+    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
+    assert {p.name for p in day.iterdir()} == {"N"}
 
 
 def test_process_single_mseed_channels_have_equal_length(preprocess_cfg,
@@ -362,3 +418,93 @@ def test_run_returns_false_without_input(preprocess_cfg):
 def test_run_produces_the_expected_csv_tree(preprocess_cfg, synthetic_mseed):
     run_mseed_preprocessing(preprocess_cfg)
     assert len(_csvs(preprocess_cfg.DATA_ROOT)) == 6
+
+
+# ---------------------------------------------------------------------------
+# File boundaries: partial windows and the sliver that duplicates a neighbour
+# ---------------------------------------------------------------------------
+
+def _mseed(tmp_path, name, start, seconds, channels=("E", "N", "Z"),
+           offsets=None):
+    """Writes a multi-component file of ``seconds`` starting at ``start``.
+
+    ``offsets`` shifts a component's start by that many seconds, reproducing
+    real recordings where the three channels do not begin on the same sample.
+    """
+    from obspy import Stream, UTCDateTime
+
+    from conftest import RAW_FS, _trace
+
+    offsets = offsets or {}
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    traces = []
+    for c in channels:
+        shift = offsets.get(c, 0.0)
+        npts = int((seconds - shift) * RAW_FS)
+        t = np.arange(npts) / RAW_FS
+        data = 1000.0 * np.sin(2 * np.pi * 0.5 * t)
+        traces.append(_trace(c, data, UTCDateTime(start) + shift))
+    path = raw_dir / name
+    Stream(traces).write(str(path), format="MSEED")
+    return path
+
+
+def test_process_skips_sliver_that_another_file_owns(preprocess_cfg, tmp_path):
+    """Real day files overhang midnight by a second or two. That sliver is an
+    hour the neighbouring day's file writes in full, to the identical path, so
+    writing it races the file that actually owns the hour."""
+    path = _mseed(tmp_path, "XX_TEST__24012020_000000_edge.mseed",
+                  "2020-01-23T23:59:58", 7202.0)
+    count, report = _process_single_mseed(preprocess_cfg, path,
+                                          preprocess_cfg.DATA_ROOT)
+
+    days = {p.parent.parent.name for p in _csvs(preprocess_cfg.DATA_ROOT)}
+    assert days == {"2020_01_24"}, "the 2 s sliver of the 23rd must be dropped"
+    assert count == 2 * 3
+    assert any("SKIP" in line for line in report), "the skip must be logged"
+
+
+def test_process_keeps_substantial_partial_hour(preprocess_cfg, tmp_path):
+    """A genuinely partial final hour is real data, not a boundary artefact:
+    it is kept, padded to the full hour with NaN so the grid stays aligned."""
+    path = _mseed(tmp_path, "XX_TEST__24012020_000000_half.mseed",
+                  "2020-01-24T00:00:00", 3600.0 + 1800.0)
+    count, _ = _process_single_mseed(preprocess_cfg, path,
+                                     preprocess_cfg.DATA_ROOT)
+    assert count == 2 * 3
+
+    data = np.loadtxt(
+        preprocess_cfg.DATA_ROOT / "2020_01_24" / "N" / "20200124_010000_N.csv",
+        delimiter=",",
+    )
+    assert len(data) == 3600 * preprocess_cfg.Fs
+    half = int(1800 * preprocess_cfg.Fs)
+    assert not np.isnan(data[:half - 10]).all(), "first half hour is real data"
+    assert np.isnan(data[half + 10:]).all(), "second half hour must be NaN"
+
+
+def test_process_partial_window_keeps_channels_aligned(preprocess_cfg,
+                                                       tmp_path):
+    """Regression: channels start a second or two apart, so a partial window
+    gave each one a different length -- and shunted a late-starting channel's
+    samples to the top of the hour, as if it had started on time."""
+    path = _mseed(tmp_path, "XX_TEST__24012020_000000_skew.mseed",
+                  "2020-01-24T00:00:00", 5400.0,
+                  offsets={"E": 0.0, "N": 120.0, "Z": 240.0})
+    _process_single_mseed(preprocess_cfg, path, preprocess_cfg.DATA_ROOT)
+
+    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
+    per_channel = {
+        c: np.loadtxt(day / c / f"20200124_000000_{c}.csv", delimiter=",")
+        for c in ("E", "N", "Z")
+    }
+    assert len({len(a) for a in per_channel.values()}) == 1
+
+    # Each channel's NaN head must match how late it started, to the sample.
+    for channel, late_sec in (("E", 0.0), ("N", 120.0), ("Z", 240.0)):
+        data = per_channel[channel]
+        leading = int(np.argmax(~np.isnan(data))) if np.isnan(data[0]) else 0
+        assert leading == pytest.approx(
+            late_sec * preprocess_cfg.Fs, abs=1
+        ), f"{channel} samples sit at the wrong offset in the hour"

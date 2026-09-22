@@ -196,17 +196,97 @@ def test_shipped_config_is_valid(tmp_path, monkeypatch):
 
 
 def test_shipped_config_rosenstein_window_is_usable():
-    """Regression: config once held slope=[0, 0.2, 5, 2], which collapses the
-    short fit to two samples and makes every R-squared a meaningless 1.0."""
-    from chaos.chaotic_features import split_slope_windows
+    """Regression: config has twice shipped a two-sample short window
+    (slope=[0, 0.2, 5, 2], then slope=[0, 0.2, 4, 10]), which collapses the
+    short fit to a line through two points and makes every R-squared a
+    meaningless 1.0. The whole results CSV inherits the artefact."""
+    from chaos.chaotic_features import MIN_FIT_POINTS, split_slope_windows
 
     real = load_config()
     fe = real["feature_extraction"]
     ros = fe["features"]["rosenstein"]
-    short, _ = split_slope_windows(ros["slope"])
 
-    span = (short[1] - short[0]) * ros["mean_period"] * fe["fs"]
-    assert span >= 2, (
-        f"short fit window {short} spans {span + 1:.0f} samples at "
-        f"fs={fe['fs']}; a straight line through <3 points always reports R2=1"
-    )
+    for label, window in zip(("short", "long"),
+                             split_slope_windows(ros["slope"])):
+        if window is None:
+            continue
+        lo = round(window[0] * ros["mean_period"] * fe["fs"])
+        hi = round(window[1] * ros["mean_period"] * fe["fs"])
+        assert hi - lo + 1 >= MIN_FIT_POINTS, (
+            f"{label} fit window {window} spans {hi - lo + 1} samples at "
+            f"fs={fe['fs']}; a line through <{MIN_FIT_POINTS} points always "
+            "reports R2=1"
+        )
+
+
+def test_shipped_config_passes_validation(tmp_path, monkeypatch):
+    """The config that ships must survive the same checks a user's would."""
+    monkeypatch.setattr(main_module, "SCRIPT_DIR", tmp_path)
+    Settings(load_config(), "ELBA", "EVENT").validate()
+
+
+# ---------------------------------------------------------------------------
+# Settings.validate — reject configs that produce plausible-looking garbage
+# ---------------------------------------------------------------------------
+
+def _settings(config, tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "SCRIPT_DIR", tmp_path)
+    return Settings(config, "ELBA", "EVENT")
+
+
+def test_validate_rejects_degenerate_rosenstein_window(minimal_config, tmp_path,
+                                                       monkeypatch):
+    """The bug that produced 53,535 rows of R2=1.0 must not load at all."""
+    minimal_config["feature_extraction"]["features"]["rosenstein"]["slope"] = \
+        [0, 0.2, 4, 10]
+    with pytest.raises(ValueError, match="rosenstein short window"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_rejects_degenerate_long_window(minimal_config, tmp_path,
+                                                 monkeypatch):
+    minimal_config["feature_extraction"]["features"]["rosenstein"]["slope"] = \
+        [0, 1, 4, 4.1]
+    with pytest.raises(ValueError, match="rosenstein long window"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_rejects_freqmax_above_decimated_nyquist(minimal_config,
+                                                          tmp_path,
+                                                          monkeypatch):
+    """Decimation runs with no_filter=True, so a passband reaching fs/2 folds
+    straight back into the band the features are measured on."""
+    minimal_config["preprocessing"]["freq_max"] = 3.0  # fs is 5.0
+    with pytest.raises(ValueError, match="Nyquist"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_rejects_non_advancing_window(minimal_config, tmp_path,
+                                               monkeypatch):
+    minimal_config["feature_extraction"]["step_sec"] = 0
+    with pytest.raises(ValueError, match="never advance"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_rejects_empty_channels(minimal_config, tmp_path, monkeypatch):
+    minimal_config["feature_extraction"]["channels"] = []
+    with pytest.raises(ValueError, match="channels is empty"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_rejects_inverted_band(minimal_config, tmp_path, monkeypatch):
+    minimal_config["preprocessing"]["freq_min"] = 2.0
+    minimal_config["preprocessing"]["freq_max"] = 0.1
+    with pytest.raises(ValueError, match="freq_min < freq_max"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_reports_every_problem_at_once(minimal_config, tmp_path,
+                                                monkeypatch):
+    """One run, one list -- not one error per re-run."""
+    minimal_config["feature_extraction"]["channels"] = []
+    minimal_config["feature_extraction"]["step_sec"] = 0
+    with pytest.raises(ValueError) as exc:
+        _settings(minimal_config, tmp_path, monkeypatch)
+    assert "channels is empty" in str(exc.value)
+    assert "never advance" in str(exc.value)

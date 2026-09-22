@@ -102,7 +102,7 @@ def _decimation_grid(seg_start, factor):
     return phase, (seg_start + phase) // factor
 
 
-def _process_single_mseed(cfg, mseed_file, output_base) -> int:
+def _process_single_mseed(cfg, mseed_file, output_base) -> tuple[int, list[str]]:
     """Processes one MSEED file into hourly per-channel CSV files.
 
     The pipeline is: read → gap handling → bandpass filter → decimation →
@@ -111,7 +111,7 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
     the clean segments around them are filtered to avoid smearing data.
 
     Args:
-        cfg: Configuration object (see :class:`main.Settings`).
+        cfg: Configuration object (see :class:`chaos.pipeline.Settings`).
         mseed_file: Path to the MSEED file to process.
         output_base: Root directory where hourly CSVs are written.
 
@@ -126,6 +126,17 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
 
     real_fs = st_full[0].stats.sampling_rate
     decimation_factor = max(1, int(real_fs / cfg.Fs))
+    effective_fs = real_fs / decimation_factor
+    if abs(effective_fs - cfg.Fs) > 1e-9:
+        # Decimation can only divide the rate by an integer, so a target Fs
+        # that does not divide the instrument rate silently yields a different
+        # output rate -- and stage 2 turns sample counts into seconds using
+        # cfg.Fs, so the whole time axis would be off.
+        print(
+            f"  [WARN] {mseed_file.name}: {real_fs} Hz / {decimation_factor} = "
+            f"{effective_fs:g} Hz, not the configured Fs={cfg.Fs:g} Hz. "
+            f"Set fs to a divisor of {real_fs:g} to keep the time axis exact."
+        )
 
     gaps = st_full.get_gaps(min_gap=-1)
     actual_gaps = [g for g in gaps if g[7] > 0] if gaps else []
@@ -195,20 +206,48 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
             tr.data = np.ma.array(data, mask=big_gap_mask)
 
     file_date = parse_file_date(mseed_file, st_full)
-    day_start = UTCDateTime(file_date.year, file_date.month, file_date.day, 0, 0, 0)
-    day_end = day_start + 86400
-    num_windows = int((day_end - day_start) / cfg.PREPROCESS_WINDOW_SEC)
+    grid_origin = UTCDateTime(file_date.year, file_date.month, file_date.day, 0, 0, 0)
     min_seg_len = max(20, int(3.0 / cfg.FREQMIN * real_fs))
 
-    total_csv_created = 0
-    for window_idx in range(num_windows):
-        window_start = day_start + (window_idx * cfg.PREPROCESS_WINDOW_SEC)
-        window_end = window_start + cfg.PREPROCESS_WINDOW_SEC
-        # Stream.slice() returns views into st_full; the copy below is the
-        # only one needed, and it is window-sized rather than day-sized.
-        st_window = st_full.slice(starttime=window_start, endtime=window_end)
+    # The window grid stays anchored to the named day's midnight so output file
+    # names keep landing on clean boundaries, but its extent follows what the
+    # stream actually covers. Deriving the extent from the named day alone
+    # silently discarded every sample outside it, so a file that started late
+    # or ran past midnight lost most of its data without a word.
+    window_sec = cfg.PREPROCESS_WINDOW_SEC
+    window_raw_n = int(round(window_sec * real_fs))
+    stream_start = min(tr.stats.starttime for tr in st_full)
+    stream_end = max(tr.stats.endtime for tr in st_full)
+    first_idx = int(np.floor((stream_start - grid_origin) / window_sec))
+    last_idx = int(np.floor((stream_end - grid_origin) / window_sec))
 
-        if len(st_window) == 0 or len(st_window[0].data) < 100:
+    total_csv_created = 0
+    skipped_windows = []
+    for window_idx in range(first_idx, last_idx + 1):
+        window_start = grid_origin + (window_idx * window_sec)
+        window_end = window_start + window_sec
+        # Half-open [start, end): nearest_sample=False plus a sub-microsecond
+        # nudge keeps the sample sitting exactly on window_end out of this
+        # window, where it belongs to the next one. An inclusive endpoint gave
+        # every window one extra sample, duplicating a sample per hour and
+        # sliding stage 2's window grid a little further out of step each hour.
+        st_window = st_full.slice(
+            starttime=window_start,
+            endtime=window_end - 1e-6,
+            nearest_sample=False,
+        )
+
+        if len(st_window) == 0:
+            continue
+
+        # Real day-long files overhang midnight by a second or two, so the grid
+        # picks up a sliver of the neighbouring day -- an hour the neighbouring
+        # file already writes in full, to the very same path. Anything shorter
+        # than one filter warm-up is both unfilterable and a duplicate, so it
+        # is dropped rather than raced against the file that owns that hour.
+        covered = max(len(tr.data) for tr in st_window)
+        if covered < min_seg_len:
+            skipped_windows.append((window_start, covered))
             continue
 
         st_proc = st_window.copy()
@@ -219,6 +258,22 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
                 if np.ma.is_masked(tr.data)
                 else np.array(tr.data, dtype=float)
             )
+            # Channels rarely start on the same sample, and a partial window is
+            # partial by a different amount on each. Laying every channel out
+            # on the window's own sample grid -- NaN where it has nothing --
+            # keeps them the same length and puts each sample at its true
+            # offset in the hour, instead of shunting a late-starting channel
+            # back to the top of the file.
+            offset = int(round((tr.stats.starttime - window_start) * real_fs))
+            if offset != 0 or len(data) != window_raw_n:
+                padded = np.full(window_raw_n, np.nan, dtype=float)
+                lo = max(0, offset)
+                hi = min(window_raw_n, offset + len(data))
+                if hi > lo:
+                    padded[lo:hi] = data[lo - offset: hi - offset]
+                data = padded
+                tr.stats.starttime = window_start
+
             nan_mask = np.isnan(data)
             if nan_mask.any():
                 win_nan_map[tr.id] = nan_mask
@@ -288,7 +343,7 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
                 res_tr.stats.sampling_rate = cfg.Fs
 
         date_folder = window_start.datetime.strftime("%Y_%m_%d")
-        for component in ("E", "N", "Z"):
+        for component in cfg.PREPROCESS_CHANNELS:
             try:
                 tr = st_decimated.select(component=component)[0]
             except IndexError:
@@ -306,6 +361,13 @@ def _process_single_mseed(cfg, mseed_file, output_base) -> int:
             )
             _save_csv_with_retry(csv_path, data_out)
             total_csv_created += 1
+
+    for window_start, covered in skipped_windows:
+        gap_report.append(
+            f"    SKIP  {window_start} covered by {covered} sample(s) "
+            f"(< {min_seg_len} needed to filter); the file owning that "
+            f"{window_sec:g}s window writes it in full"
+        )
 
     return total_csv_created, gap_report
 
@@ -343,7 +405,7 @@ def run_mseed_preprocessing(cfg) -> bool:
     timestamped name (usually true for one-file-per-day inputs).
 
     Args:
-        cfg: Configuration object (see :class:`main.Settings`).
+        cfg: Configuration object (see :class:`chaos.pipeline.Settings`).
 
     Returns:
         ``True`` if at least one file was processed, ``False`` otherwise.

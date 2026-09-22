@@ -110,6 +110,95 @@ class Settings:
         self.StepSize = int(self.STEP_SEC * self.Fs)
         self.PREV_LEN = int(self.PREV_SEC * self.Fs)
 
+        self.validate()
+
+    def validate(self) -> None:
+        """Rejects settings that would yield silently meaningless output.
+
+        These are all mistakes that produce a full, plausible-looking results
+        CSV rather than an error: a fit window too short to be a fit, a
+        passband above the Nyquist frequency of the decimated signal, a
+        non-advancing window. Catching them here costs one check per run and
+        saves re-deriving a whole dataset.
+
+        Raises:
+            ValueError: If any setting cannot produce usable features.
+        """
+        from chaos.chaotic_features import MIN_FIT_POINTS, split_slope_windows
+
+        problems: list[str] = []
+
+        if self.Fs <= 0:
+            problems.append(f"feature_extraction.fs must be > 0, got {self.Fs}")
+        if self.WinSize < 2:
+            problems.append(
+                f"win_sec={self.WIN_SEC} at fs={self.Fs} is {self.WinSize} "
+                "samples; a window needs at least 2"
+            )
+        if self.StepSize < 1:
+            problems.append(
+                f"step_sec={self.STEP_SEC} at fs={self.Fs} is {self.StepSize} "
+                "samples; the window would never advance"
+            )
+        if self.PREV_LEN < 0:
+            problems.append(f"prev_sec must be >= 0, got {self.PREV_SEC}")
+        if not self.CHANNELS:
+            problems.append("feature_extraction.channels is empty")
+        if not self.PREPROCESS_CHANNELS:
+            problems.append("preprocessing.channels is empty")
+
+        if not 0 < self.FREQMIN < self.FREQMAX:
+            problems.append(
+                f"need 0 < freq_min < freq_max, got {self.FREQMIN} and "
+                f"{self.FREQMAX}"
+            )
+        elif self.Fs > 0 and self.FREQMAX >= self.Fs / 2:
+            # Decimation runs with no_filter=True, so the bandpass is the only
+            # anti-alias filter in the chain. A passband reaching the decimated
+            # Nyquist folds energy back into the band being measured.
+            problems.append(
+                f"freq_max={self.FREQMAX} is at or above the Nyquist frequency "
+                f"of the decimated signal (fs/2 = {self.Fs / 2}); decimation "
+                "would alias it back into the passband"
+            )
+
+        ros = self.FEATURES.get("rosenstein")
+        if ros is None:
+            problems.append("feature_extraction.features.rosenstein is missing")
+        else:
+            mean_period = float(ros["mean_period"])
+            if mean_period <= 0:
+                problems.append(
+                    f"rosenstein.mean_period must be > 0, got {mean_period}"
+                )
+            else:
+                try:
+                    windows = split_slope_windows(ros["slope"])
+                except ValueError as exc:
+                    problems.append(str(exc))
+                    windows = ()
+                for label, window in zip(("short", "long"), windows):
+                    if window is None:
+                        continue
+                    lo = int(round(window[0] * mean_period * self.Fs))
+                    hi = int(round(window[1] * mean_period * self.Fs))
+                    n_points = hi - lo + 1
+                    if hi <= lo or n_points < MIN_FIT_POINTS:
+                        problems.append(
+                            f"rosenstein {label} window {tuple(window)} spans "
+                            f"{max(0, n_points)} sample(s) at fs={self.Fs} and "
+                            f"mean_period={mean_period}; a straight line "
+                            f"through fewer than {MIN_FIT_POINTS} points always "
+                            "reports R2=1. Widen it or raise fs."
+                        )
+
+        if problems:
+            raise ValueError(
+                "Invalid configuration for "
+                f"{self.STATION}/{self.EARTHQUAKE_NAME}:\n  - "
+                + "\n  - ".join(problems)
+            )
+
 
 def _collect_jobs(raw_root: Path) -> list[tuple[str, str]]:
     """Returns every ``(station, earthquake_name)`` folder pair under ``raw``.

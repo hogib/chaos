@@ -236,11 +236,17 @@ def fit_log_divergence(ave_ln_div, fs, mean_period, start, end):
         ``nan`` and ``n_points`` is ``0`` when the window is unusable.
     """
     ave = np.asarray(ave_ln_div, dtype=np.float64).ravel()
-    nz = int(np.count_nonzero(ave))
+    # The curve ends in a run of exact zeros: those are the steps at which no
+    # trajectory pair is still in range, not measurements of zero divergence.
+    # Only the prefix before that run may be fitted. Counting non-zeros would
+    # give the same answer here but quietly shorten the usable range if an
+    # interior step happened to average to exactly zero.
+    nonzero = np.flatnonzero(ave)
+    usable = int(nonzero[-1]) + 1 if nonzero.size else 0
 
     lo = int(round(start * mean_period * fs))
     hi = int(round(end * mean_period * fs))
-    if lo < 0 or hi <= lo or hi > nz:
+    if lo < 0 or hi <= lo or hi >= usable:
         return np.nan, np.nan, 0
 
     t = np.arange(lo, hi + 1, dtype=np.float64) / fs / mean_period
@@ -348,6 +354,11 @@ def corrdim_core(x, tau, de):
     x = np.asarray(x, dtype=np.float64).ravel()
     N = len(x)
     n = N - (de - 1) * tau
+
+    # Too short to embed at all: np.zeros would raise on the negative
+    # dimension, and the caller only ever wants a number back.
+    if n <= 0:
+        return 0.0
 
     Y = np.zeros((de, n))
     for i in range(de):

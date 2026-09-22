@@ -109,13 +109,13 @@ def run_feature_extraction(cfg) -> None:
     """Runs the sliding-window feature extraction stage over all dates.
 
     Args:
-        cfg: Configuration object (see :class:`main.Settings`).
+        cfg: Configuration object (see :class:`chaos.pipeline.Settings`).
     """
-    print("\n" + "=" * 50)
-    print("STAGE 2: FEATURE EXTRACTION (3 CHANNELS)")
-    print("=" * 50)
-
     channels = cfg.CHANNELS
+
+    print("\n" + "=" * 50)
+    print(f"STAGE 2: FEATURE EXTRACTION ({len(channels)} CHANNEL(S))")
+    print("=" * 50)
 
     if not cfg.DATA_ROOT.exists():
         print(f"[ERROR] Data folder not found: {cfg.DATA_ROOT}")
@@ -165,26 +165,45 @@ def run_feature_extraction(cfg) -> None:
                 )
 
                 raw = {}
-                ref_len = None
                 for ch in channels:
                     ch_path = date_dir / ch / f"{timestamp}_{ch}.csv"
                     try:
                         df = pd.read_csv(
                             ch_path, header=None, usecols=[0], dtype=np.float64
                         )
-                        arr = df.iloc[:, 0].to_numpy(dtype=np.float64)
-                        raw[ch] = arr
-                        ref_len = len(arr)
+                        raw[ch] = df.iloc[:, 0].to_numpy(dtype=np.float64)
                     except Exception:
                         raw[ch] = None
 
-                if ref_len is None:
+                loaded = [a for a in raw.values() if a is not None]
+                if not loaded:
                     print("ERROR (all channels failed to load)")
                     continue
 
+                # Channels are paired by sample index, so they have to agree on
+                # length. A missing or short file is padded to the longest one
+                # with NaN rather than left ragged: NaN makes compute_window
+                # report the affected windows as empty, whereas a ragged array
+                # would hand it a silently truncated window and get a plausible
+                # but wrong number back.
+                ref_len = max(len(a) for a in loaded)
+                ragged = {
+                    ch: len(a) for ch, a in raw.items()
+                    if a is not None and len(a) != ref_len
+                }
+                if ragged:
+                    print(
+                        f"WARNING: channel length mismatch {ragged} vs {ref_len}; "
+                        "padding with NaN... ",
+                        end="", flush=True,
+                    )
                 for ch in channels:
                     if raw[ch] is None:
                         raw[ch] = np.full(ref_len, np.nan)
+                    elif len(raw[ch]) < ref_len:
+                        raw[ch] = np.concatenate(
+                            [raw[ch], np.full(ref_len - len(raw[ch]), np.nan)]
+                        )
 
                 x_total = {}
                 for ch in channels:
@@ -210,8 +229,16 @@ def run_feature_extraction(cfg) -> None:
 
                 starts = np.arange(num_windows) * cfg.StepSize
                 ends = starts + cfg.WinSize
-                time_stamps = ends / cfg.Fs / 60.0
+                # `ends` indexes into the carry-over buffer concatenated with
+                # this file, so subtracting the carry-over puts Time_min back on
+                # this hour's own clock: minutes from the start of the hour to
+                # the end of the window. Without it every row was offset by
+                # PREV_SEC -- and by a *different* offset for the first file of
+                # the run, where there is no carry-over to subtract.
+                carry_len = n_total - ref_len
+                time_stamps = (ends - carry_len) / cfg.Fs / 60.0
                 hour_num = _extract_hour(ref_csv.stem)
+                hour_tag = f"{hour_num:02d}" if hour_num >= 0 else "xx"
 
                 skip_count = (
                     min(cfg.WARMUP_COUNT, num_windows)
@@ -238,7 +265,7 @@ def run_feature_extraction(cfg) -> None:
 
                 for w in range(num_windows):
                     row = {
-                        "Window_ID": f"{date_name}_{hour_num:02d}_w{w + 1:02d}",
+                        "Window_ID": f"{date_name}_{hour_tag}_w{w + 1:02d}",
                         "Time_min": round(float(time_stamps[w]), 3),
                     }
                     if w < skip_count:

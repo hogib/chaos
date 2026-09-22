@@ -201,3 +201,77 @@ def test_run_feature_extraction_ignores_logs_folder(extraction_tree):
     run_feature_extraction(extraction_tree)
     df = _only_csv(extraction_tree)
     assert not any(wid.startswith("logs") for wid in df["Window_ID"])
+
+
+# ---------------------------------------------------------------------------
+# Ragged channels and the Time_min clock
+# ---------------------------------------------------------------------------
+
+def _write_channel(root, date_name, stamp, channel, data):
+    ch_dir = root / date_name / channel
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    np.savetxt(ch_dir / f"{stamp}_{channel}.csv", data, delimiter=",",
+               fmt="%.8f")
+
+
+def test_run_feature_extraction_pads_ragged_channels(fake_cfg, tmp_path,
+                                                     recwarn):
+    """Regression: window counts came from channels[0] alone, so a shorter
+    channel was sliced past its end and features were computed on a silently
+    truncated window -- a plausible number for a window that does not exist.
+    The short channel must read as NaN instead."""
+    root = tmp_path / "proceeded"
+    rng = np.random.RandomState(3)
+    _write_channel(root, "2020_01_24", "20200124_000000", "E", rng.randn(3000))
+    _write_channel(root, "2020_01_24", "20200124_000000", "N", rng.randn(2000))
+
+    fake_cfg.CHANNELS = ["E", "N"]
+    fake_cfg.WARMUP_COUNT = 0
+    fake_cfg.DATA_ROOT = root
+    fake_cfg.OUTPUT_ROOT = tmp_path / "out"
+    fake_cfg.OUTPUT_ROOT.mkdir()
+
+    run_feature_extraction(fake_cfg)
+    df = _only_csv(fake_cfg)
+
+    # E covers all 9 windows; N runs out after 2000 samples.
+    assert df["E_ham_std"].notna().all()
+    assert df["N_ham_std"].isna().any()
+    # Nothing truncated: every window N does report is a full one.
+    assert df["N_ham_std"].notna().sum() < len(df)
+    assert not any("empty slice" in str(w.message) for w in recwarn)
+
+
+def test_run_feature_extraction_time_min_is_minutes_into_the_hour(
+        extraction_tree):
+    """Regression: Time_min counted from the start of the carry-over buffer,
+    so every row sat PREV_SEC too late -- and the first file of the run, which
+    has no carry-over, used a different offset again."""
+    run_feature_extraction(extraction_tree)
+    df = _only_csv(extraction_tree)
+
+    cfg = extraction_tree
+    win_min = cfg.WinSize / cfg.Fs / 60.0
+    step_min = cfg.StepSize / cfg.Fs / 60.0
+    carry_min = cfg.PREV_LEN / cfg.Fs / 60.0
+
+    # Hour 00 of the first date has no carry-over: window 1 ends one window
+    # length into the hour.
+    first = df[df["Window_ID"].str.startswith("2020_01_24_00_")]
+    assert first["Time_min"].iloc[0] == pytest.approx(win_min, abs=1e-3)
+
+    # Every later hour does have one, so window 1 ends earlier in the hour.
+    later = df[df["Window_ID"].str.startswith("2020_01_24_01_")]
+    assert later["Time_min"].iloc[0] == pytest.approx(
+        win_min - carry_min, abs=1e-3
+    )
+    # The clock restarts each hour and advances one step per window.
+    steps = later["Time_min"].diff().dropna().to_numpy()
+    assert steps == pytest.approx(np.full(len(steps), step_min), abs=1e-3)
+
+
+def test_run_feature_extraction_window_id_hour_is_two_digits(extraction_tree):
+    run_feature_extraction(extraction_tree)
+    df = _only_csv(extraction_tree)
+    hours = {wid.split("_")[3] for wid in df["Window_ID"]}
+    assert hours == {"00", "01"}
