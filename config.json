@@ -8,16 +8,20 @@
 
   "paths": {
     "raw_dir": "raw",
-    "processed_dir": "proceeded",
     "results_dir": "results",
-    "results_subdir": "ENZ"
+    "results_subdir": "ENZ",
+    "cache_dir": "cache"
+  },
+
+  "cache": {
+    "enabled": false
   },
 
   "preprocessing": {
-    "window_sec": 3600.0,
     "freq_min": 0.1,
     "freq_max": 2.0,
     "gap_threshold_sec": 2.0,
+    "filter_pad_sec": null,
     "channels": ["E", "N", "Z"]
   },
 
@@ -25,7 +29,7 @@
     "fs": 5.0,
     "win_sec": 200,
     "step_sec": 50,
-    "prev_sec": 150,
+    "max_gap_sec": null,
     "channels": ["N"],
     "n_jobs": -1,
     "warmup_count": 3,

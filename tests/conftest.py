@@ -13,11 +13,8 @@ for p in (REPO_ROOT, SRC_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-
-# Gap length in seconds. 60.07 s is 6007 raw samples at 100 Hz, which is not
-# a multiple of the decimation factor, so the resumed segment starts off the
-# decimated grid -- the case the phase handling has to get right.
-GAP_SEC = 60.07
+RAW_FS = 100.0
+START = "2020-01-24T00:00:00"
 
 
 @pytest.fixture
@@ -53,65 +50,58 @@ def fake_features_config():
 
 
 @pytest.fixture
-def fake_cfg(sample_rate, fake_features_config):
+def fake_cfg(tmp_path, sample_rate, fake_features_config):
+    """A settings stand-in for the streaming pipeline."""
+    out = tmp_path / "results"
+    out.mkdir(parents=True, exist_ok=True)
     return SimpleNamespace(
         Fs=sample_rate,
         FEATURES=fake_features_config,
         CHANNELS=["N"],
+        PREPROCESS_CHANNELS=["E", "N", "Z"],
         N_JOBS=1,
         WARMUP_COUNT=3,
-        WIN_SEC=200,
-        STEP_SEC=50,
-        PREV_SEC=150,
+        WIN_SEC=200.0,
+        STEP_SEC=50.0,
         WinSize=1000,
         StepSize=250,
-        PREV_LEN=750,
+        MAX_GAP_SEC=200.0,
+        FREQMIN=0.1,
+        FREQMAX=2.0,
+        GAP_THRESHOLD=2.0,
+        FILTER_PAD_SEC=None,
         STATION="TEST",
         EARTHQUAKE_NAME="EVENT",
+        MSEED_INPUT_DIR=tmp_path / "raw",
+        OUTPUT_ROOT=out,
+        CACHE_ENABLED=False,
+        CACHE_ROOT=tmp_path / "cache",
     )
 
 
 @pytest.fixture
-def preprocess_cfg(tmp_path, sample_rate):
-    """Config for the preprocessing stage, writing into a temp tree."""
-    return SimpleNamespace(
-        Fs=sample_rate,
-        PREPROCESS_WINDOW_SEC=3600.0,
-        FREQMIN=0.1,
-        FREQMAX=2.0,
-        GAP_THRESHOLD=2.0,
-        PREPROCESS_CHANNELS=["E", "N", "Z"],
-        MSEED_INPUT_DIR=tmp_path / "raw",
-        DATA_ROOT=tmp_path / "proceeded",
-        N_JOBS=1,
-        STATION="TEST",
-        EARTHQUAKE_NAME="EVENT",
-    )
+def preprocess_cfg(fake_cfg):
+    """Alias kept so preprocessing tests read naturally."""
+    return fake_cfg
 
 
-TOTAL_SEC = 7200.0
-RAW_FS = 100.0
-GAP_START_SEC = 1500.0
+# ---------------------------------------------------------------------------
+# Synthetic waveform builders
+# ---------------------------------------------------------------------------
 
-
-def _waveform(seed, npts=int(TOTAL_SEC * RAW_FS), fs=RAW_FS):
-    """One component's full 2-hour waveform, as a function of absolute time.
-
-    Built once per component so that the gapped and gap-free fixtures share
-    byte-identical samples everywhere outside the gap; that is what makes the
-    two directly comparable.
-    """
+def waveform(n, seed=0, fs=RAW_FS, t_offset=0.0):
+    """A broadband-looking signal with energy inside the 0.1-2 Hz passband."""
     rng = np.random.RandomState(seed)
-    t = np.arange(npts) / fs
+    t = np.arange(n) / fs + t_offset
     return (
         1000.0 * np.sin(2 * np.pi * 0.5 * t)
         + 300.0 * np.sin(2 * np.pi * 1.3 * t)
-        + 50.0 * rng.randn(npts)
+        + 50.0 * rng.randn(n)
     )
 
 
-def _trace(component, data, starttime, fs=RAW_FS):
-    """Wraps a sample array in a broadband Trace."""
+def trace(component, data, starttime, fs=RAW_FS):
+    """Wraps samples in a broadband Trace."""
     from obspy import Trace
 
     tr = Trace(data=np.asarray(data, dtype=np.float64))
@@ -124,91 +114,63 @@ def _trace(component, data, starttime, fs=RAW_FS):
     return tr
 
 
-def _write(stream, tmp_path, name):
-    raw_dir = tmp_path / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    path = raw_dir / f"XX_TEST__24012020_000000_{name}.mseed"
-    stream.write(str(path), format="MSEED")
+def write_mseed(path, start, seconds, channels=("E", "N", "Z"), seed=0,
+                gap=None, offsets=None, fs=RAW_FS):
+    """Writes one multi-component MSEED file.
+
+    Args:
+        path: Destination path (parent directories are created).
+        start: :class:`obspy.UTCDateTime` of the first sample.
+        seconds: Span covered by the file.
+        channels: Components to write.
+        seed: Waveform seed; the same seed gives the same ground motion.
+        gap: ``(offset_sec, duration_sec)`` to leave out of every channel.
+        offsets: Per-channel start delay in seconds.
+        fs: Raw sampling rate.
+
+    Returns:
+        The path written.
+    """
+    from obspy import Stream
+
+    offsets = offsets or {}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    traces = []
+    for component in channels:
+        shift = offsets.get(component, 0.0)
+        npts = int(round((seconds - shift) * fs))
+        data = waveform(npts, seed=seed, fs=fs,
+                        t_offset=float(start) + shift)
+        origin = start + shift
+        if gap is None:
+            traces.append(trace(component, data, origin, fs))
+            continue
+        cut = int(round(gap[0] * fs))
+        resume = cut + int(round(gap[1] * fs))
+        traces.append(trace(component, data[:cut], origin, fs))
+        traces.append(
+            trace(component, data[resume:], origin + resume / fs, fs)
+        )
+    Stream(traces).write(str(path), format="MSEED")
     return path
 
 
-def _build(tmp_path, name, gapped):
-    """Writes a 2-hour, 3-component file where ``gapped`` components have a gap.
+@pytest.fixture
+def mseed_factory(tmp_path):
+    """Returns a helper that writes MSEED files into the raw input dir."""
+    def _make(name, start_offset_sec, seconds, **kwargs):
+        from obspy import UTCDateTime
 
-    Every component's samples come from the same :func:`_waveform` call, so a
-    gapped file and a gap-free one agree exactly outside the gap.
-    """
-    from obspy import Stream, UTCDateTime
-
-    start = UTCDateTime("2020-01-24T00:00:00")
-    cut = int(GAP_START_SEC * RAW_FS)
-    resume = cut + int(GAP_SEC * RAW_FS)
-
-    traces = []
-    for seed, c in enumerate(("E", "N", "Z")):
-        full = _waveform(seed)
-        if c in gapped:
-            traces.append(_trace(c, full[:cut], start))
-            traces.append(
-                _trace(c, full[resume:], start + resume / RAW_FS)
-            )
-        else:
-            traces.append(_trace(c, full, start))
-    return _write(Stream(traces), tmp_path, name)
+        return write_mseed(
+            tmp_path / "raw" / name,
+            UTCDateTime(START) + start_offset_sec,
+            seconds,
+            **kwargs,
+        )
+    return _make
 
 
 @pytest.fixture
-def synthetic_mseed(tmp_path):
-    """A 2-hour, 3-component 100 Hz MSEED file with no gaps.
-
-    Naming follows the ``_YYYYMMDD_`` convention the date parser looks for.
-    Each fixture uses a distinct file name so several can coexist in one test.
-    """
-    return _build(tmp_path, "clean", gapped=())
-
-
-@pytest.fixture
-def synthetic_mseed_with_gap(tmp_path):
-    """Same span and samples as :func:`synthetic_mseed`, gapped in every channel.
-
-    The gap falls inside the first hour; the second hour is continuous.
-    """
-    return _build(tmp_path, "gap", gapped=("E", "N", "Z"))
-
-
-@pytest.fixture
-def synthetic_mseed_gap_one_channel(tmp_path):
-    """Two-hour file where only channel N has a gap.
-
-    Exercises the case where, inside one window, one channel goes down the
-    gap-handling branch while the others take the gap-free branch.
-    """
-    return _build(tmp_path, "gapn", gapped=("N",))
-
-
-@pytest.fixture
-def extraction_tree(tmp_path, fake_cfg, sample_rate):
-    """Builds a ``proceeded/`` tree of per-channel CSVs and a matching cfg.
-
-    Two date folders, two hourly files each, for channel ``N`` only — enough
-    to exercise warm-up skipping and the previous-window carry-over.
-    """
-    rng = np.random.RandomState(7)
-    data_root = tmp_path / "proceeded"
-    n_per_file = 3000
-
-    for date_name, stamps in (
-        ("2020_01_24", ("20200124_000000", "20200124_010000")),
-        ("2020_01_25", ("20200125_000000", "20200125_010000")),
-    ):
-        ch_dir = data_root / date_name / "N"
-        ch_dir.mkdir(parents=True)
-        for stamp in stamps:
-            t = np.arange(n_per_file) / sample_rate
-            sig = np.sin(2 * np.pi * 0.3 * t) + 0.4 * rng.randn(n_per_file)
-            np.savetxt(ch_dir / f"{stamp}_N.csv", sig, delimiter=",", fmt="%.8f")
-
-    fake_cfg.DATA_ROOT = data_root
-    fake_cfg.OUTPUT_ROOT = tmp_path / "results"
-    fake_cfg.OUTPUT_ROOT.mkdir(parents=True)
-    return fake_cfg
+def two_hour_file(mseed_factory):
+    """A single continuous 2-hour, 3-component file."""
+    return mseed_factory("XX_TEST__part00.mseed", 0, 7200.0)

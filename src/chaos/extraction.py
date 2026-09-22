@@ -1,8 +1,16 @@
-"""Sliding-window feature extraction from preprocessed per-channel CSVs."""
+"""Sliding-window feature extraction over the streamed recording.
+
+Windows slide across one continuous timeline rather than across hour-sized
+files, so there is no carry-over buffer to splice and no window whose samples
+straddle two independently filtered chunks.
+"""
 
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+
+from chaos.preprocess import grid_time
+from chaos.recording import RollingBuffer, iter_blocks
 
 from chaos.chaotic_features import (compute_corr_dim,
                                     compute_lyapunov_rosenstein,
@@ -88,225 +96,217 @@ def compute_window(segment: np.ndarray, w_idx: int, cfg) -> dict:
     return result
 
 
-def _extract_hour(stem: str) -> int:
-    """Extracts the hour from a CSV file stem.
+BATCH_WINDOWS = 512
+
+
+class _WindowNamer:
+    """Assigns ``Window_ID`` and ``Time_min`` from a window's absolute time.
+
+    Both columns describe the window's position inside the calendar hour its
+    start falls in, which is what they meant before the pipeline became
+    continuous — so anything already reading them keeps working.
+    """
+
+    def __init__(self):
+        self._hour_key = None
+        self._counter = 0
+
+    def name(self, start_time, end_time):
+        """Returns ``(window_id, time_min)`` for one window.
+
+        Args:
+            start_time: Window start as :class:`obspy.UTCDateTime`.
+            end_time: Window end as :class:`obspy.UTCDateTime`.
+
+        Returns:
+            Tuple of the window's id and the minutes from the start of its
+            hour to its end.
+        """
+        dt = start_time.datetime
+        hour_key = (dt.year, dt.month, dt.day, dt.hour)
+        if hour_key != self._hour_key:
+            self._hour_key = hour_key
+            self._counter = 0
+        self._counter += 1
+
+        hour_start = start_time - (dt.minute * 60 + dt.second
+                                   + dt.microsecond / 1e6)
+        window_id = (
+            f"{dt.year:04d}_{dt.month:02d}_{dt.day:02d}_"
+            f"{dt.hour:02d}_w{self._counter:02d}"
+        )
+        return window_id, round(float(end_time - hour_start) / 60.0, 3)
+
+
+def _iso(utc_time) -> str:
+    """Formats a :class:`obspy.UTCDateTime` as a compact ISO UTC string."""
+    return utc_time.datetime.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _blank_row(channels):
+    """Returns the per-channel feature cells of a window that was not computed."""
+    return {
+        f"{ch}_{key}": np.nan for ch in channels for key in FEATURE_KEYS
+    }
+
+
+def _flush(rows, out_path, first_write) -> bool:
+    """Appends a batch of rows to the results CSV.
+
+    Rows are written as they are produced rather than accumulated, so a
+    year-long run does not have to hold its own results in memory.
 
     Args:
-        stem: Filename stem of the form ``YYYYMMDD_HHMMSS[_CHANNEL]``.
+        rows: List of row dictionaries.
+        out_path: Destination CSV.
+        first_write: Whether the header still needs writing.
 
     Returns:
-        Hour of day, or ``-1`` if it cannot be determined.
+        ``False``, to be assigned back to the caller's ``first_write``.
     """
-    digits = [d for d in stem.split("_") if d.isdigit()]
-    if len(digits) >= 2 and len(digits[1]) >= 2:
-        return int(digits[1][:2])
-    if len(digits) == 1 and int(digits[0]) < 24:
-        return int(digits[0])
-    return -1
+    if not rows:
+        return first_write
+    frame = pd.DataFrame(rows)
+    frame.to_csv(
+        out_path,
+        index=False,
+        mode="w" if first_write else "a",
+        header=first_write,
+    )
+    return False
 
 
-def run_feature_extraction(cfg) -> None:
-    """Runs the sliding-window feature extraction stage over all dates.
+def run_feature_extraction(cfg) -> bool:
+    """Streams the recording and writes one feature row per window.
 
     Args:
         cfg: Configuration object (see :class:`chaos.pipeline.Settings`).
-    """
-    channels = cfg.CHANNELS
 
+    Returns:
+        ``True`` if at least one row was written.
+    """
     print("\n" + "=" * 50)
-    print(f"STAGE 2: FEATURE EXTRACTION ({len(channels)} CHANNEL(S))")
+    print("FEATURE EXTRACTION (MSEED -> FEATURES, NO INTERMEDIATE FILES)")
     print("=" * 50)
 
-    if not cfg.DATA_ROOT.exists():
-        print(f"[ERROR] Data folder not found: {cfg.DATA_ROOT}")
-        return
-
-    date_folders = sorted(
-        d for d in cfg.DATA_ROOT.iterdir() if d.is_dir() and d.name != "logs"
-    )
-    if not date_folders:
-        print(f"[ERROR] No date folders found under {cfg.DATA_ROOT}.")
-        return
+    channels = list(cfg.CHANNELS)
+    mseed_files = sorted(cfg.MSEED_INPUT_DIR.glob("*.mseed"))
+    if not mseed_files:
+        print(f"[SKIPPED] No .mseed files found in: {cfg.MSEED_INPUT_DIR}")
+        return False
 
     print(f"Station   : {cfg.STATION} | Channels: {', '.join(channels)}")
     print(f"Window    : {cfg.WIN_SEC}s  | Step: {cfg.STEP_SEC}s  | Fs: {cfg.Fs} Hz")
+    print(f"Files     : {len(mseed_files)}")
 
-    csv_rows: list[dict] = []
-    prev_data = {ch: np.array([]) for ch in channels}
-    is_first_file = True
+    out_path = cfg.OUTPUT_ROOT / f"{cfg.STATION}_{cfg.EARTHQUAKE_NAME}_features.csv"
+    namer = _WindowNamer()
+    buffer = RollingBuffer(channels, cfg.WinSize, cfg.StepSize)
 
-    # A single pool for the whole run: joblib reuses its workers across
-    # every `parallel(...)` call inside the context, instead of spawning
-    # and tearing down a process pool once per file and per channel.
+    gap_lines: list[str] = []
+    pending: list[tuple] = []
+    rows: list[dict] = []
+    first_write = True
+    total_rows = 0
+    emitted = 0
+
     with Parallel(n_jobs=cfg.N_JOBS, prefer="processes") as parallel:
-        for d_idx, date_dir in enumerate(date_folders):
-            ref_dir = None
-            for ch in channels:
-                ch_dir = date_dir / ch
-                if ch_dir.exists() and any(ch_dir.glob("*.csv")):
-                    ref_dir = ch_dir
-                    break
 
-            if ref_dir is None:
-                continue
+        def run_batch():
+            """Computes the queued windows and turns them into CSV rows."""
+            nonlocal pending, rows, total_rows, first_write
+            if not pending:
+                return
+            tasks = [
+                delayed(compute_window)(segments[ch], idx, cfg)
+                for idx, (_, segments) in enumerate(pending)
+                for ch in channels
+            ]
+            flat = parallel(tasks)
+            for w, (meta, _) in enumerate(pending):
+                row = dict(meta)
+                for c, ch in enumerate(channels):
+                    res = flat[w * len(channels) + c]
+                    for key in FEATURE_KEYS:
+                        row[f"{ch}_{key}"] = res.get(key, np.nan)
+                rows.append(row)
+            total_rows += len(pending)
+            pending = []
+            if len(rows) >= BATCH_WINDOWS:
+                first_write = _flush(rows, out_path, first_write)
+                rows = []
 
-            csv_files = sorted(ref_dir.glob("*.csv"))
-            date_name = date_dir.name
-            print(
-                f"[{d_idx + 1}/{len(date_folders)}] Date: {date_name}  "
-                f"({len(csv_files)} files)"
-            )
-
-            for f_idx, ref_csv in enumerate(csv_files):
-                timestamp = ref_csv.stem.rsplit("_", 1)[0]
-                print(
-                    f"  [{f_idx + 1}/{len(csv_files)}] {ref_csv.name}... ",
-                    end="", flush=True,
-                )
-
-                raw = {}
-                for ch in channels:
-                    ch_path = date_dir / ch / f"{timestamp}_{ch}.csv"
-                    try:
-                        df = pd.read_csv(
-                            ch_path, header=None, usecols=[0], dtype=np.float64
-                        )
-                        raw[ch] = df.iloc[:, 0].to_numpy(dtype=np.float64)
-                    except Exception:
-                        raw[ch] = None
-
-                loaded = [a for a in raw.values() if a is not None]
-                if not loaded:
-                    print("ERROR (all channels failed to load)")
-                    continue
-
-                # Channels are paired by sample index, so they have to agree on
-                # length. A missing or short file is padded to the longest one
-                # with NaN rather than left ragged: NaN makes compute_window
-                # report the affected windows as empty, whereas a ragged array
-                # would hand it a silently truncated window and get a plausible
-                # but wrong number back.
-                ref_len = max(len(a) for a in loaded)
-                ragged = {
-                    ch: len(a) for ch, a in raw.items()
-                    if a is not None and len(a) != ref_len
+        for block in iter_blocks(cfg, mseed_files):
+            gap_lines.extend(block.gap_report)
+            # A block that does not continue the previous one restarts the
+            # window grid at its own first sample; the buffer detects that and
+            # drops its tail, so no window ever spans an outage the stitcher
+            # judged too long to represent.
+            for start_index, segments in buffer.push(block):
+                start_time = grid_time(start_index, cfg.Fs)
+                end_time = grid_time(start_index + cfg.WinSize, cfg.Fs)
+                window_id, time_min = namer.name(start_time, end_time)
+                meta = {
+                    "window_start": _iso(start_time),
+                    "window_end": _iso(end_time),
+                    "Window_ID": window_id,
+                    "Time_min": time_min,
                 }
-                if ragged:
-                    print(
-                        f"WARNING: channel length mismatch {ragged} vs {ref_len}; "
-                        "padding with NaN... ",
-                        end="", flush=True,
-                    )
-                for ch in channels:
-                    if raw[ch] is None:
-                        raw[ch] = np.full(ref_len, np.nan)
-                    elif len(raw[ch]) < ref_len:
-                        raw[ch] = np.concatenate(
-                            [raw[ch], np.full(ref_len - len(raw[ch]), np.nan)]
-                        )
+                if emitted < cfg.WARMUP_COUNT:
+                    # The first windows of a run are reported but left blank:
+                    # they are what the warm-up count exists to discard.
+                    rows.append({**meta, **_blank_row(channels)})
+                    total_rows += 1
+                else:
+                    pending.append((meta, {ch: seg.copy()
+                                           for ch, seg in segments.items()}))
+                emitted += 1
+                if len(pending) >= BATCH_WINDOWS:
+                    run_batch()
 
-                x_total = {}
-                for ch in channels:
-                    x_total[ch] = (
-                        np.concatenate([prev_data[ch], raw[ch]])
-                        if len(prev_data[ch]) > 0
-                        else raw[ch].copy()
-                    )
+            run_batch()
+            print(f"  [WINDOWS] {total_rows} rows so far")
 
-                n_total = len(x_total[channels[0]])
-                num_windows = max(0, (n_total - cfg.WinSize) // cfg.StepSize + 1)
+        run_batch()
 
-                if num_windows == 0:
-                    print(f"WARNING: insufficient data ({n_total} samples)")
-                    for ch in channels:
-                        n_t = len(x_total[ch])
-                        prev_data[ch] = (
-                            x_total[ch][-cfg.PREV_LEN:].copy()
-                            if n_t >= cfg.PREV_LEN
-                            else x_total[ch].copy()
-                        )
-                    continue
+    first_write = _flush(rows, out_path, first_write)
 
-                starts = np.arange(num_windows) * cfg.StepSize
-                ends = starts + cfg.WinSize
-                # `ends` indexes into the carry-over buffer concatenated with
-                # this file, so subtracting the carry-over puts Time_min back on
-                # this hour's own clock: minutes from the start of the hour to
-                # the end of the window. Without it every row was offset by
-                # PREV_SEC -- and by a *different* offset for the first file of
-                # the run, where there is no carry-over to subtract.
-                carry_len = n_total - ref_len
-                time_stamps = (ends - carry_len) / cfg.Fs / 60.0
-                hour_num = _extract_hour(ref_csv.stem)
-                hour_tag = f"{hour_num:02d}" if hour_num >= 0 else "xx"
+    _write_gap_log(cfg, mseed_files, gap_lines)
 
-                skip_count = (
-                    min(cfg.WARMUP_COUNT, num_windows)
-                    if is_first_file and cfg.WARMUP_COUNT > 0
-                    else 0
-                )
-
-                # One dispatch for every (channel, window) pair of this file. The
-                # pool itself lives for the whole run (see `parallel` below), so
-                # workers are not respawned per file or per channel.
-                tasks = [
-                    delayed(compute_window)(x_total[ch][s:e], skip_count + w, cfg)
-                    for ch in channels
-                    for w, (s, e) in enumerate(
-                        zip(starts[skip_count:], ends[skip_count:])
-                    )
-                ]
-                flat = parallel(tasks)
-                per_channel = num_windows - skip_count
-                ch_results = {
-                    ch: flat[i * per_channel: (i + 1) * per_channel]
-                    for i, ch in enumerate(channels)
-                }
-
-                for w in range(num_windows):
-                    row = {
-                        "Window_ID": f"{date_name}_{hour_tag}_w{w + 1:02d}",
-                        "Time_min": round(float(time_stamps[w]), 3),
-                    }
-                    if w < skip_count:
-                        for ch in channels:
-                            for key in FEATURE_KEYS:
-                                row[f"{ch}_{key}"] = np.nan
-                    else:
-                        res_idx = w - skip_count
-                        for ch in channels:
-                            res = ch_results[ch][res_idx]
-                            for key in FEATURE_KEYS:
-                                row[f"{ch}_{key}"] = res.get(key, np.nan)
-                    csv_rows.append(row)
-
-                for ch in channels:
-                    n_t = len(x_total[ch])
-                    prev_data[ch] = (
-                        x_total[ch][-cfg.PREV_LEN:].copy()
-                        if n_t >= cfg.PREV_LEN
-                        else x_total[ch].copy()
-                    )
-
-                print(f"OK ({num_windows} windows)")
-                is_first_file = False
-
-    if not csv_rows:
-        print("\n[WARNING] No data to save.")
-        return
-
-    result_df = pd.DataFrame(csv_rows)
-    csv_name = (
-        f"{cfg.STATION}_{date_folders[0].name}-{date_folders[-1].name}"
-        f"_ENZ_features.csv"
-    )
-    out_path = cfg.OUTPUT_ROOT / csv_name
-    result_df.to_csv(out_path, index=False)
+    if total_rows == 0:
+        print("\n[WARNING] No windows could be formed from the input.")
+        return False
 
     print(f"\nCSV created: {out_path}")
-    print(f"   {len(result_df)} rows  |  {len(result_df.columns)} columns")
+    print(f"   {total_rows} rows")
+    preview = pd.read_csv(out_path, nrows=5)
     print("\n" + "=" * 50)
     print("FIRST 5 ROWS OF CSV")
     print("=" * 50)
-    print(result_df.head(5).to_string(index=False))
+    print(preview.to_string(index=False))
     print("=" * 50 + "\n")
+    return True
+
+
+def _write_gap_log(cfg, mseed_files, gap_lines) -> None:
+    """Writes the gap report beside the results.
+
+    Args:
+        cfg: Configuration object.
+        mseed_files: The input files, for the header.
+        gap_lines: Report lines gathered from every block.
+    """
+    from datetime import datetime
+
+    log_dir = cfg.OUTPUT_ROOT / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"gap_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    with open(path, "w", encoding="utf-8") as log:
+        log.write(
+            f"GAP REPORT — {cfg.STATION} / {cfg.EARTHQUAKE_NAME} "
+            f"({len(mseed_files)} file(s))\n"
+            f"Target FS: {cfg.Fs} Hz | Bandpass: {cfg.FREQMIN}–{cfg.FREQMAX} Hz | "
+            f"Gap threshold: {cfg.GAP_THRESHOLD} s\n\n"
+        )
+        for line in gap_lines:
+            log.write(line + "\n")

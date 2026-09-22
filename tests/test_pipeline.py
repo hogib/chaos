@@ -19,22 +19,23 @@ def minimal_config():
         "single_run": {"station": "ELBA", "earthquake_name": "EVENT"},
         "paths": {
             "raw_dir": "raw",
-            "processed_dir": "proceeded",
             "results_dir": "results",
             "results_subdir": "ENZ",
+            "cache_dir": "cache",
         },
+        "cache": {"enabled": False},
         "preprocessing": {
-            "window_sec": 3600.0,
             "freq_min": 0.1,
             "freq_max": 2.0,
             "gap_threshold_sec": 2.0,
+            "filter_pad_sec": None,
             "channels": ["E", "N", "Z"],
         },
         "feature_extraction": {
             "fs": 5.0,
             "win_sec": 200,
             "step_sec": 50,
-            "prev_sec": 150,
+            "max_gap_sec": None,
             "n_jobs": 2,
             "warmup_count": 3,
             "channels": ["N"],
@@ -77,8 +78,9 @@ def test_settings_derives_paths(tmp_path, minimal_config, monkeypatch):
     cfg = Settings(minimal_config, "ELBA", "EVENT")
 
     assert cfg.MSEED_INPUT_DIR == tmp_path / "raw" / "ELBA" / "EVENT"
-    assert cfg.DATA_ROOT == tmp_path / "proceeded" / "ELBA" / "EVENT"
     assert cfg.OUTPUT_ROOT == tmp_path / "results" / "ELBA" / "EVENT" / "ENZ"
+    assert cfg.CACHE_ROOT == tmp_path / "cache" / "ELBA" / "EVENT"
+    assert not hasattr(cfg, "DATA_ROOT"), "the intermediate tree is gone"
 
 
 def test_settings_creates_output_root(tmp_path, minimal_config, monkeypatch):
@@ -93,7 +95,7 @@ def test_settings_derives_sample_counts(tmp_path, minimal_config, monkeypatch):
 
     assert cfg.WinSize == int(200 * 5.0) == 1000
     assert cfg.StepSize == int(50 * 5.0) == 250
-    assert cfg.PREV_LEN == int(150 * 5.0) == 750
+    assert cfg.MAX_GAP_SEC == 200.0, "defaults to one window"
 
 
 def test_settings_exposes_feature_block(tmp_path, minimal_config, monkeypatch):
@@ -146,25 +148,22 @@ def test_run_single_honours_config_n_jobs(tmp_path, minimal_config, monkeypatch)
     value was silently discarded for every single-station run."""
     monkeypatch.setattr(main_module, "SCRIPT_DIR", tmp_path)
     seen = {}
-    monkeypatch.setattr(main_module, "run_mseed_preprocessing",
-                        lambda cfg: seen.setdefault("pre", cfg.N_JOBS))
     monkeypatch.setattr(main_module, "run_feature_extraction",
                         lambda cfg: seen.setdefault("fe", cfg.N_JOBS))
 
     _run_single(minimal_config, "ELBA", "EVENT")
-    assert seen == {"pre": 2, "fe": 2}
+    assert seen == {"fe": 2}
 
 
 def test_run_single_override_wins(tmp_path, minimal_config, monkeypatch):
     """Batch mode passes n_jobs=1 to avoid oversubscribing the outer pool."""
     monkeypatch.setattr(main_module, "SCRIPT_DIR", tmp_path)
     seen = {}
-    monkeypatch.setattr(main_module, "run_mseed_preprocessing",
-                        lambda cfg: seen.setdefault("pre", cfg.N_JOBS))
-    monkeypatch.setattr(main_module, "run_feature_extraction", lambda cfg: None)
+    monkeypatch.setattr(main_module, "run_feature_extraction",
+                        lambda cfg: seen.setdefault("fe", cfg.N_JOBS))
 
     _run_single(minimal_config, "ELBA", "EVENT", n_jobs=1)
-    assert seen["pre"] == 1
+    assert seen["fe"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -290,3 +289,71 @@ def test_validate_reports_every_problem_at_once(minimal_config, tmp_path,
         _settings(minimal_config, tmp_path, monkeypatch)
     assert "channels is empty" in str(exc.value)
     assert "never advance" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Settings.validate — keys from the two-stage layout must not be ignored
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("section,key,value", [
+    ("paths", "processed_dir", "proceeded"),
+    ("feature_extraction", "prev_sec", 150),
+    ("preprocessing", "window_sec", 3600.0),
+])
+def test_validate_rejects_obsolete_keys(minimal_config, tmp_path, monkeypatch,
+                                        section, key, value):
+    """A config carried over from the two-stage pipeline must say so rather
+    than look like it is still being honoured."""
+    minimal_config[section][key] = value
+    with pytest.raises(ValueError, match=f"{section}.{key} is obsolete"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_rejects_step_larger_than_window(minimal_config, tmp_path,
+                                                  monkeypatch):
+    minimal_config["feature_extraction"]["step_sec"] = 500   # win_sec is 200
+    with pytest.raises(ValueError, match="windows would skip samples"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+def test_validate_rejects_negative_max_gap(minimal_config, tmp_path,
+                                           monkeypatch):
+    minimal_config["feature_extraction"]["max_gap_sec"] = -1.0
+    with pytest.raises(ValueError, match="max_gap_sec must be >= 0"):
+        _settings(minimal_config, tmp_path, monkeypatch)
+
+
+# ---------------------------------------------------------------------------
+# New settings
+# ---------------------------------------------------------------------------
+
+def test_cache_is_off_unless_asked_for(minimal_config, tmp_path, monkeypatch):
+    cfg = _settings(minimal_config, tmp_path, monkeypatch)
+    assert cfg.CACHE_ENABLED is False
+
+
+def test_cache_can_be_enabled(minimal_config, tmp_path, monkeypatch):
+    minimal_config["cache"]["enabled"] = True
+    assert _settings(minimal_config, tmp_path, monkeypatch).CACHE_ENABLED
+
+
+def test_max_gap_defaults_to_one_window(minimal_config, tmp_path, monkeypatch):
+    cfg = _settings(minimal_config, tmp_path, monkeypatch)
+    assert cfg.MAX_GAP_SEC == cfg.WIN_SEC
+
+
+def test_max_gap_can_be_set(minimal_config, tmp_path, monkeypatch):
+    minimal_config["feature_extraction"]["max_gap_sec"] = 900.0
+    assert _settings(minimal_config, tmp_path, monkeypatch).MAX_GAP_SEC == 900.0
+
+
+def test_filter_pad_defaults_to_none(minimal_config, tmp_path, monkeypatch):
+    assert _settings(minimal_config, tmp_path, monkeypatch).FILTER_PAD_SEC is None
+
+
+def test_shipped_config_has_no_obsolete_keys():
+    """The config that ships must already be on the new schema."""
+    real = load_config()
+    assert "processed_dir" not in real["paths"]
+    assert "prev_sec" not in real["feature_extraction"]
+    assert "window_sec" not in real["preprocessing"]

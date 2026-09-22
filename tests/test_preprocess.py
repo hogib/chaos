@@ -1,21 +1,20 @@
-"""Unit tests for chaos/preprocess.py — helpers and worker pooling."""
+"""Unit tests for chaos/preprocess.py — the global grid and per-file decimation."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import pytest
 from obspy import Stream, Trace, UTCDateTime
 
-from chaos.preprocess import (_decimation_grid, _gap_duration_sec,
-                              _process_single_mseed, _resolve_workers,
-                              _save_csv_with_retry, parse_file_date,
-                              run_mseed_preprocessing)
+from chaos.preprocess import (_as_float_array, _contiguous_runs,
+                              _gap_duration_sec, _resolve_workers,
+                              filter_pad_sec, grid_index, grid_index_floor,
+                              grid_time, preprocess_file)
+from conftest import RAW_FS, START, trace, waveform
 
 
 @pytest.fixture
 def simple_stream():
-    """A one-trace stream useful for helper tests."""
     tr = Trace(data=np.zeros(1000))
     tr.stats.station = "TEST"
     tr.stats.channel = "BHN"
@@ -27,11 +26,56 @@ def simple_stream():
 
 
 # ---------------------------------------------------------------------------
-# _gap_duration_sec
+# The global sample grid
+# ---------------------------------------------------------------------------
+
+def test_grid_index_round_trips():
+    fs = 5.0
+    t = UTCDateTime("2020-01-24T00:00:00")
+    assert grid_time(grid_index(t, fs), fs) == t
+
+
+def test_grid_index_is_absolute_not_per_file():
+    """Two files an hour apart must land on the same grid, which is what lets
+    them be decimated independently and still line up to the sample."""
+    fs = 5.0
+    a = UTCDateTime("2020-01-24T00:00:00")
+    assert grid_index(a + 3600, fs) - grid_index(a, fs) == int(3600 * fs)
+
+
+def test_grid_index_rounds_up_and_floor_rounds_down():
+    fs = 5.0
+    between = UTCDateTime(0) + 0.1      # between grid samples 0 and 1
+    assert grid_index(between, fs) == 1
+    assert grid_index_floor(between, fs) == 0
+
+
+def test_grid_index_exact_sample_is_itself():
+    fs = 5.0
+    exact = UTCDateTime(0) + 0.4        # exactly grid sample 2
+    assert grid_index(exact, fs) == 2
+    assert grid_index_floor(exact, fs) == 2
+
+
+# ---------------------------------------------------------------------------
+# filter_pad_sec
+# ---------------------------------------------------------------------------
+
+def test_filter_pad_defaults_scale_with_freqmin():
+    assert filter_pad_sec(SimpleNamespace(FREQMIN=0.1)) == 60.0
+    assert filter_pad_sec(SimpleNamespace(FREQMIN=0.01)) == 600.0
+
+
+def test_filter_pad_honours_explicit_setting():
+    cfg = SimpleNamespace(FREQMIN=0.1, FILTER_PAD_SEC=250.0)
+    assert filter_pad_sec(cfg) == 250.0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
 # ---------------------------------------------------------------------------
 
 def test_gap_duration_uses_matching_channel_fs(simple_stream):
-    # gap tuple layout: (net, sta, loc, cha, t1, t2, dur, npts)
     gap = ("XX", "TEST", "", "BHN", None, None, 0.0, 500)
     assert _gap_duration_sec(gap, simple_stream) == pytest.approx(5.0)
 
@@ -41,470 +85,222 @@ def test_gap_duration_falls_back_when_no_channel_match(simple_stream):
     assert _gap_duration_sec(gap, simple_stream) == pytest.approx(10.0)
 
 
-# ---------------------------------------------------------------------------
-# parse_file_date
-# ---------------------------------------------------------------------------
-
-def test_parse_file_date_yyyymmdd(simple_stream, tmp_path):
-    f = tmp_path / "XX_TEST__20200124_000000.mseed"
-    f.write_bytes(b"")
-    assert parse_file_date(f, simple_stream).strftime("%Y-%m-%d") == "2020-01-24"
+def test_as_float_array_turns_mask_into_nan():
+    masked = np.ma.array([1.0, 2.0, 3.0], mask=[False, True, False])
+    out = _as_float_array(masked)
+    assert np.isnan(out[1]) and out[0] == 1.0
 
 
-def test_parse_file_date_ddmmyyyy(simple_stream, tmp_path):
-    f = tmp_path / "XX_TEST__24012020_000000.mseed"
-    f.write_bytes(b"")
-    # DDMMYYYY is tried first; YYYYMMDD is the fallback
-    assert parse_file_date(f, simple_stream).strftime("%Y-%m-%d") == "2020-01-24"
+def test_contiguous_runs_finds_each_stretch():
+    valid = np.array([0, 1, 1, 0, 0, 1, 1, 1, 0], dtype=bool)
+    assert list(_contiguous_runs(valid)) == [(1, 3), (5, 8)]
 
 
-def test_parse_file_date_fallback_to_stream_start(simple_stream, tmp_path):
-    f = tmp_path / "no_date_here.mseed"
-    f.write_bytes(b"")
-    assert parse_file_date(f, simple_stream).strftime("%Y-%m-%d") == "2020-01-01"
+def test_contiguous_runs_empty_when_nothing_valid():
+    assert list(_contiguous_runs(np.zeros(5, dtype=bool))) == []
 
-
-# ---------------------------------------------------------------------------
-# _save_csv_with_retry
-# ---------------------------------------------------------------------------
-
-def test_save_csv_writes_file(tmp_path):
-    out = tmp_path / "out.csv"
-    data = np.array([1.0, 2.0, 3.0])
-    _save_csv_with_retry(out, data)
-    loaded = np.loadtxt(out, delimiter=",")
-    assert np.allclose(loaded, data)
-
-
-def test_save_csv_retries_on_permission_error(tmp_path):
-    out = tmp_path / "out.csv"
-    data = np.array([1.0, 2.0])
-
-    call_count = {"n": 0}
-    real_savetxt = np.savetxt
-
-    def flaky(path, *args, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] < 3:
-            raise PermissionError("locked")
-        return real_savetxt(path, *args, **kwargs)
-
-    with patch("chaos.preprocess.np.savetxt", side_effect=flaky), \
-         patch("chaos.preprocess.time.sleep"):
-        _save_csv_with_retry(out, data, retries=5, delay=0.0)
-
-    assert call_count["n"] == 3
-    assert out.exists()
-
-
-# ---------------------------------------------------------------------------
-# _resolve_workers
-# ---------------------------------------------------------------------------
 
 def test_resolve_workers_caps_at_n_items():
-    cfg = SimpleNamespace(N_JOBS=64)
-    assert _resolve_workers(cfg, n_items=4) == 4
+    assert _resolve_workers(SimpleNamespace(N_JOBS=64), n_items=4) == 4
 
 
 def test_resolve_workers_uses_config():
-    cfg = SimpleNamespace(N_JOBS=3)
-    assert _resolve_workers(cfg, n_items=100) == 3
-
-
-def test_resolve_workers_defaults_to_cpu_count():
-    cfg = SimpleNamespace(N_JOBS=-1)
-    import os
-    expected = min(100, os.cpu_count() or 1)
-    assert _resolve_workers(cfg, n_items=100) == expected
+    assert _resolve_workers(SimpleNamespace(N_JOBS=3), n_items=100) == 3
 
 
 def test_resolve_workers_never_below_one():
-    cfg = SimpleNamespace(N_JOBS=0)
-    assert _resolve_workers(cfg, n_items=0) == 1
+    assert _resolve_workers(SimpleNamespace(N_JOBS=0), n_items=0) == 1
 
 
 # ---------------------------------------------------------------------------
-# _process_single_mseed — end-to-end, gap-free input
+# preprocess_file
 # ---------------------------------------------------------------------------
 
-def _csvs(base):
-    return sorted(base.rglob("*.csv"))
+def test_preprocess_file_covers_exactly_its_own_span(preprocess_cfg,
+                                                     two_hour_file):
+    """The block must cover the file's span and not one sample more: padding
+    is context for the filter, never data."""
+    start_index, channels, _ = preprocess_file(preprocess_cfg, two_hour_file)
+
+    assert grid_time(start_index, preprocess_cfg.Fs) == UTCDateTime(START)
+    for name, arr in channels.items():
+        assert len(arr) == int(7200 * preprocess_cfg.Fs), name
 
 
-def test_process_single_mseed_writes_hourly_csvs(preprocess_cfg, synthetic_mseed):
-    count, _ = _process_single_mseed(
-        preprocess_cfg, synthetic_mseed, preprocess_cfg.DATA_ROOT
-    )
-    # 2 hours of data x 3 components
-    assert count == 6
-    assert len(_csvs(preprocess_cfg.DATA_ROOT)) == 6
+def test_preprocess_file_channels_have_equal_length(preprocess_cfg,
+                                                    two_hour_file):
+    _, channels, _ = preprocess_file(preprocess_cfg, two_hour_file)
+    assert len({len(a) for a in channels.values()}) == 1
 
 
-def test_process_single_mseed_folder_layout(preprocess_cfg, synthetic_mseed):
-    _process_single_mseed(preprocess_cfg, synthetic_mseed,
-                          preprocess_cfg.DATA_ROOT)
-    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
-    assert day.is_dir()
-    assert {p.name for p in day.iterdir()} == {"E", "N", "Z"}
-    assert (day / "N" / "20200124_000000_N.csv").is_file()
-    assert (day / "N" / "20200124_010000_N.csv").is_file()
-
-
-def test_process_single_mseed_decimates_to_target_fs(preprocess_cfg,
-                                                     synthetic_mseed):
-    """100 Hz in, Fs=5 Hz out: one hour must land on exactly 3600*5 samples."""
-    _process_single_mseed(preprocess_cfg, synthetic_mseed,
-                          preprocess_cfg.DATA_ROOT)
-    data = np.loadtxt(
-        preprocess_cfg.DATA_ROOT / "2020_01_24" / "N" / "20200124_000000_N.csv",
-        delimiter=",",
-    )
-    assert len(data) == 3600 * preprocess_cfg.Fs
-
-
-def test_process_single_mseed_hours_do_not_overlap(preprocess_cfg,
-                                                   synthetic_mseed):
-    """Regression: the hourly slice used an inclusive endtime, so every hour
-    carried a copy of the next hour's first sample. That is one duplicated
-    sample per hour, and it slid stage 2's window grid a sample further out of
-    step with wall-clock time with every file."""
-    _process_single_mseed(preprocess_cfg, synthetic_mseed,
-                          preprocess_cfg.DATA_ROOT)
-    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
-    first = np.loadtxt(day / "N" / "20200124_000000_N.csv", delimiter=",")
-    second = np.loadtxt(day / "N" / "20200124_010000_N.csv", delimiter=",")
-
-    assert len(first) == len(second) == 3600 * preprocess_cfg.Fs
-    # The boundary sample belongs to the second hour and to it alone.
-    assert first[-1] != second[0]
-
-
-def test_process_single_mseed_covers_data_past_midnight(preprocess_cfg,
-                                                        tmp_path):
-    """Regression: the window grid was clipped to the calendar day parsed out
-    of the file name, so a file that ran past midnight had every later sample
-    silently dropped -- 30 hours in, 2 hours out."""
-    from obspy import Stream, UTCDateTime
-
-    from conftest import RAW_FS, _trace
-
-    npts = int(30 * 3600 * RAW_FS)
-    t = np.arange(npts) / RAW_FS
-    data = 1000.0 * np.sin(2 * np.pi * 0.5 * t)
-    start = UTCDateTime("2020-01-24T22:00:00")
-
-    raw_dir = tmp_path / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    path = raw_dir / "XX_TEST__24012020_220000_long.mseed"
-    Stream([_trace(c, data, start) for c in ("E", "N", "Z")]).write(
-        str(path), format="MSEED"
-    )
-
-    count, _ = _process_single_mseed(preprocess_cfg, path,
-                                     preprocess_cfg.DATA_ROOT)
-    assert count == 30 * 3, "every hour of the file must be written"
-    days = {p.parent.parent.name for p in _csvs(preprocess_cfg.DATA_ROOT)}
-    assert days == {"2020_01_24", "2020_01_25", "2020_01_26"}
-
-
-def test_process_single_mseed_honours_configured_channels(preprocess_cfg,
-                                                          synthetic_mseed):
-    """Regression: preprocessing.channels was read into Settings and then
-    ignored -- the component loop was hard-coded to E, N, Z."""
+def test_preprocess_file_honours_configured_channels(preprocess_cfg,
+                                                     two_hour_file):
     preprocess_cfg.PREPROCESS_CHANNELS = ["N"]
-    count, _ = _process_single_mseed(preprocess_cfg, synthetic_mseed,
-                                     preprocess_cfg.DATA_ROOT)
-    assert count == 2  # two hours, one component
-    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
-    assert {p.name for p in day.iterdir()} == {"N"}
+    _, channels, _ = preprocess_file(preprocess_cfg, two_hour_file)
+    assert set(channels) == {"N"}
 
 
-def test_process_single_mseed_channels_have_equal_length(preprocess_cfg,
-                                                         synthetic_mseed):
-    """Feature extraction pairs channels by index, so a length mismatch would
-    silently misalign them."""
-    _process_single_mseed(preprocess_cfg, synthetic_mseed,
-                          preprocess_cfg.DATA_ROOT)
-    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
-    lengths = {
-        c: len(np.loadtxt(day / c / f"20200124_000000_{c}.csv", delimiter=","))
-        for c in ("E", "N", "Z")
-    }
-    assert len(set(lengths.values())) == 1, lengths
+def test_preprocess_file_applies_the_bandpass(preprocess_cfg, two_hour_file):
+    """The 1.3 Hz component sits in the passband, so energy must survive."""
+    _, channels, _ = preprocess_file(preprocess_cfg, two_hour_file)
+    data = channels["N"]
+    assert np.nanstd(data) > 1.0
+    assert abs(np.nanmean(data)) < np.nanstd(data)
 
 
-def test_process_single_mseed_applies_bandpass(preprocess_cfg, synthetic_mseed):
-    """The 1.3 Hz component sits in the passband, so the output must retain
-    energy; a pure DC/constant output would mean the filter ate everything."""
-    _process_single_mseed(preprocess_cfg, synthetic_mseed,
-                          preprocess_cfg.DATA_ROOT)
-    data = np.loadtxt(
-        preprocess_cfg.DATA_ROOT / "2020_01_24" / "N" / "20200124_000000_N.csv",
-        delimiter=",",
-    )
-    assert np.std(data) > 1.0
-    assert abs(np.mean(data)) < np.std(data)
-
-
-def test_process_single_mseed_reports_no_gaps(preprocess_cfg, synthetic_mseed):
-    _, report = _process_single_mseed(
-        preprocess_cfg, synthetic_mseed, preprocess_cfg.DATA_ROOT
-    )
+def test_preprocess_file_reports_no_gaps(preprocess_cfg, two_hour_file):
+    _, _, report = preprocess_file(preprocess_cfg, two_hour_file)
     assert "0 small" in report[0] and "0 large" in report[0]
 
 
-# ---------------------------------------------------------------------------
-# _process_single_mseed — gapped input
-# ---------------------------------------------------------------------------
+def test_preprocess_file_keeps_large_gap_as_nan(preprocess_cfg, mseed_factory):
+    path = mseed_factory("gapped.mseed", 0, 7200.0, gap=(1500.0, 60.0))
+    _, channels, report = preprocess_file(preprocess_cfg, path)
 
-def test_process_gap_is_reported(preprocess_cfg, synthetic_mseed_with_gap):
-    _, report = _process_single_mseed(
-        preprocess_cfg, synthetic_mseed_with_gap, preprocess_cfg.DATA_ROOT
-    )
-    # one gap per component
+    # One gap per channel: obspy counts them per trace pair, not per instant.
     assert "3 large" in report[0]
-    assert sum("LARGE" in line for line in report[1:]) == 3
+    assert sum("LARGE" in line for line in report) == 3
+    nan = np.flatnonzero(np.isnan(channels["N"]))
+    assert nan.size > 0, "a 60 s gap must survive as NaN, not be invented"
+    assert nan.min() / preprocess_cfg.Fs == pytest.approx(1500, abs=40)
 
 
-def test_process_gap_preserved_as_nan(preprocess_cfg, synthetic_mseed_with_gap):
-    """A 60 s gap is far above the 2 s threshold, so it must survive as NaN
-    rather than being interpolated across."""
-    _process_single_mseed(preprocess_cfg, synthetic_mseed_with_gap,
-                          preprocess_cfg.DATA_ROOT)
-    data = np.loadtxt(
-        preprocess_cfg.DATA_ROOT / "2020_01_24" / "N" / "20200124_000000_N.csv",
-        delimiter=",",
-    )
-    n_nan = int(np.isnan(data).sum())
-    assert n_nan > 0
-    # 60 s at 5 Hz = 300 samples, plus filter edge effects on the segments.
-    assert 200 <= n_nan <= 900, n_nan
+def test_preprocess_file_interpolates_small_gap(preprocess_cfg, mseed_factory):
+    """Below the threshold a gap is bridged, so nothing reaches the output."""
+    path = mseed_factory("small.mseed", 0, 7200.0, gap=(1500.0, 0.5))
+    _, channels, report = preprocess_file(preprocess_cfg, path)
+    assert "3 small" in report[0]
+    assert not np.isnan(channels["N"]).any()
 
 
-def test_process_gap_channels_still_equal_length(preprocess_cfg,
-                                                 synthetic_mseed_with_gap):
-    """Regression: the gapped branch used floor() for its output length while
-    the gap-free branch used obspy's ceil(), so a window where one channel had
-    a gap produced channel CSVs of different lengths."""
-    _process_single_mseed(preprocess_cfg, synthetic_mseed_with_gap,
-                          preprocess_cfg.DATA_ROOT)
-    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
-    for stamp in ("20200124_000000", "20200124_010000"):
-        lengths = {
-            c: len(np.loadtxt(day / c / f"{stamp}_{c}.csv", delimiter=","))
-            for c in ("E", "N", "Z")
-        }
-        assert len(set(lengths.values())) == 1, (stamp, lengths)
+def test_preprocess_file_places_late_channel_at_its_true_offset(
+        preprocess_cfg, mseed_factory):
+    """Channels rarely start on the same sample. A late one must sit where it
+    belongs on the grid, not be shunted to the top of the block."""
+    path = mseed_factory("skew.mseed", 0, 5400.0,
+                         offsets={"E": 0.0, "N": 120.0, "Z": 240.0})
+    _, channels, _ = preprocess_file(preprocess_cfg, path)
+
+    assert len({len(a) for a in channels.values()}) == 1
+    for name, late_sec in (("E", 0.0), ("N", 120.0), ("Z", 240.0)):
+        arr = channels[name]
+        leading = int(np.argmax(~np.isnan(arr))) if np.isnan(arr[0]) else 0
+        assert leading == pytest.approx(late_sec * preprocess_cfg.Fs, abs=2), name
 
 
-def test_process_gap_output_length_matches_gap_free(preprocess_cfg,
-                                                    synthetic_mseed,
-                                                    synthetic_mseed_with_gap,
-                                                    tmp_path):
-    """The same wall-clock hour must yield the same sample count whether or not
-    it contained a gap — otherwise the two are not on a common time base."""
-    clean_out = tmp_path / "clean"
-    gappy_out = tmp_path / "gappy"
-    _process_single_mseed(preprocess_cfg, synthetic_mseed, clean_out)
-    _process_single_mseed(preprocess_cfg, synthetic_mseed_with_gap, gappy_out)
-
-    rel = "2020_01_24/N/20200124_000000_N.csv"
-    a = np.loadtxt(clean_out / rel, delimiter=",")
-    b = np.loadtxt(gappy_out / rel, delimiter=",")
-    assert len(a) == len(b)
+def test_preprocess_file_warns_when_fs_does_not_divide(preprocess_cfg,
+                                                       two_hour_file):
+    """Decimation divides by an integer, so a target that does not divide the
+    instrument rate silently yields a different rate; it must be said."""
+    preprocess_cfg.Fs = 3.0
+    _, _, report = preprocess_file(preprocess_cfg, two_hour_file)
+    assert any("not the configured fs" in line for line in report)
 
 
-def test_process_gap_keeps_samples_on_the_decimation_grid(
-        preprocess_cfg, synthetic_mseed, synthetic_mseed_with_gap, tmp_path):
-    """Regression: each clean segment used to restart the decimation phase at
-    its own start index, so every sample *after* a gap sat on a different grid
-    than the same hour processed without one.
+# ---------------------------------------------------------------------------
+# Padding — the property that makes parallel preprocessing exact
+# ---------------------------------------------------------------------------
 
-    Both fixtures carry the same waveform, so outside the gap the two outputs
-    must agree almost exactly. Measured separation is ~0.99999999 when the
-    phase is handled and ~0.955 when it is not.
+def _filter_continuous(data, cfg, fs=RAW_FS):
+    """Filters a whole array in one pass: the reference the pads must match."""
+    tr = Trace(data=data.copy())
+    tr.stats.sampling_rate = fs
+    tr.stats.starttime = UTCDateTime(START)
+    tr.detrend("demean")
+    tr.detrend("linear")
+    tr.filter("bandpass", freqmin=cfg.FREQMIN, freqmax=cfg.FREQMAX,
+              corners=4, zerophase=True)
+    return tr.data
+
+
+def _split_files(full, tmp_path, n_chunks, prefix):
+    """Writes ``full`` as ``n_chunks`` consecutive single-channel files."""
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    chunk = len(full) // n_chunks
+    files = []
+    for i in range(n_chunks):
+        path = raw / f"{prefix}{i}.mseed"
+        Stream([
+            trace("N", full[i * chunk:(i + 1) * chunk],
+                  UTCDateTime(START) + i * chunk / RAW_FS)
+        ]).write(str(path), format="MSEED")
+        files.append(path)
+    return files
+
+
+def test_padded_per_file_filtering_matches_continuous(preprocess_cfg, tmp_path):
+    """Regression for the whole reason the pipeline was restructured.
+
+    Filtering each chunk in isolation is wrong by ~98% of the signal's standard
+    deviation at its edges. Borrowing context from the neighbouring files
+    brings it back to a rounding error — which is what lets files be processed
+    in parallel and still give the continuous answer.
     """
-    clean_out = tmp_path / "clean2"
-    gappy_out = tmp_path / "gappy2"
-    _process_single_mseed(preprocess_cfg, synthetic_mseed, clean_out)
-    _process_single_mseed(preprocess_cfg, synthetic_mseed_with_gap, gappy_out)
+    full = waveform(int(3 * 3600 * RAW_FS), seed=3,
+                    t_offset=float(UTCDateTime(START)))
+    reference = _filter_continuous(full, preprocess_cfg)
+    files = _split_files(full, tmp_path, 3, "p")
 
-    rel = "2020_01_24/N/20200124_000000_N.csv"
-    a = np.loadtxt(clean_out / rel, delimiter=",")
-    b = np.loadtxt(gappy_out / rel, delimiter=",")
+    preprocess_cfg.PREPROCESS_CHANNELS = ["N"]
+    stitched = np.concatenate([
+        preprocess_file(
+            preprocess_cfg, path,
+            files[i - 1] if i else None,
+            files[i + 1] if i + 1 < len(files) else None,
+        )[1]["N"]
+        for i, path in enumerate(files)
+    ])
 
-    # Well clear of the gap (which ends around index 7800) and of the filter
-    # edge effects on either side of it.
-    post_gap = slice(8200, 17500)
-    seg_a, seg_b = a[post_gap], b[post_gap]
-    assert not np.isnan(seg_b).any()
-
-    corr = np.corrcoef(seg_a, seg_b)[0, 1]
-    assert corr > 0.999, f"decimation phase mismatch after gap (corr={corr:.4f})"
-
-
-def test_process_gap_in_one_channel_keeps_lengths_aligned(
-        preprocess_cfg, synthetic_mseed_gap_one_channel):
-    """Only N is gapped, so within one window N takes the gap-handling branch
-    while E and Z take the gap-free one. The two branches must agree on the
-    output length, or the channels silently desynchronise."""
-    _process_single_mseed(preprocess_cfg, synthetic_mseed_gap_one_channel,
-                          preprocess_cfg.DATA_ROOT)
-    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
-    lengths = {
-        c: len(np.loadtxt(day / c / f"20200124_000000_{c}.csv", delimiter=","))
-        for c in ("E", "N", "Z")
-    }
-    assert len(set(lengths.values())) == 1, lengths
-
-    n = np.loadtxt(day / "N" / "20200124_000000_N.csv", delimiter=",")
-    e = np.loadtxt(day / "E" / "20200124_000000_E.csv", delimiter=",")
-    assert np.isnan(n).any(), "the gapped channel should retain its NaN block"
-    assert not np.isnan(e).any(), "the clean channel should have no NaN"
+    factor = int(RAW_FS / preprocess_cfg.Fs)
+    expected = reference[::factor][:len(stitched)]
+    rel = np.max(np.abs(stitched[:len(expected)] - expected)) / np.std(expected)
+    assert rel < 0.01, f"padded filtering drifted from continuous by {rel:.3%}"
 
 
-# ---------------------------------------------------------------------------
-# _decimation_grid
-# ---------------------------------------------------------------------------
+def test_without_padding_the_seams_are_wrong(preprocess_cfg, tmp_path):
+    """The complement of the test above: with no neighbours to borrow from the
+    seams really are badly wrong. This is what the old per-hour code shipped."""
+    full = waveform(int(2 * 3600 * RAW_FS), seed=4,
+                    t_offset=float(UTCDateTime(START)))
+    reference = _filter_continuous(full, preprocess_cfg)
+    files = _split_files(full, tmp_path, 2, "u")
 
-@pytest.mark.parametrize("seg_start,factor,expected", [
-    (0, 20, (0, 0)),
-    (20, 20, (0, 1)),
-    (156007, 20, (13, 7801)),
-    (1, 20, (19, 1)),
-    (7, 1, (0, 7)),
-])
-def test_decimation_grid_values(seg_start, factor, expected):
-    assert _decimation_grid(seg_start, factor) == expected
+    preprocess_cfg.PREPROCESS_CHANNELS = ["N"]
+    unpadded = [preprocess_file(preprocess_cfg, p)[1]["N"] for p in files]
+    got = np.concatenate(unpadded)
 
-
-@pytest.mark.parametrize("seg_start", [0, 1, 7, 19, 20, 999, 156007, 360000])
-def test_decimation_grid_lands_on_absolute_multiples(seg_start):
-    """The first kept sample must sit at an absolute index divisible by the
-    decimation factor — that is what makes the grid global rather than
-    per-segment."""
-    factor = 20
-    phase, out_start = _decimation_grid(seg_start, factor)
-    assert 0 <= phase < factor
-    assert (seg_start + phase) % factor == 0
-    assert out_start * factor == seg_start + phase
-
-
-# ---------------------------------------------------------------------------
-# run_mseed_preprocessing — the gap log must actually contain the gaps
-# ---------------------------------------------------------------------------
-
-def test_run_writes_gap_log_with_content(preprocess_cfg,
-                                         synthetic_mseed_with_gap):
-    """Regression: the log file was created with only a header, and every gap
-    line went to the worker's stdout where it was lost."""
-    assert run_mseed_preprocessing(preprocess_cfg) is True
-
-    logs = list((preprocess_cfg.DATA_ROOT / "logs").glob("gap_report_*.txt"))
-    assert len(logs) == 1
-    text = logs[0].read_text(encoding="utf-8")
-
-    assert "GAP REPORT" in text
-    assert synthetic_mseed_with_gap.name in text
-    assert "3 large" in text
-    assert "LARGE" in text
-
-
-def test_run_returns_false_without_input(preprocess_cfg):
-    preprocess_cfg.MSEED_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    assert run_mseed_preprocessing(preprocess_cfg) is False
-
-
-def test_run_produces_the_expected_csv_tree(preprocess_cfg, synthetic_mseed):
-    run_mseed_preprocessing(preprocess_cfg)
-    assert len(_csvs(preprocess_cfg.DATA_ROOT)) == 6
-
-
-# ---------------------------------------------------------------------------
-# File boundaries: partial windows and the sliver that duplicates a neighbour
-# ---------------------------------------------------------------------------
-
-def _mseed(tmp_path, name, start, seconds, channels=("E", "N", "Z"),
-           offsets=None):
-    """Writes a multi-component file of ``seconds`` starting at ``start``.
-
-    ``offsets`` shifts a component's start by that many seconds, reproducing
-    real recordings where the three channels do not begin on the same sample.
-    """
-    from obspy import Stream, UTCDateTime
-
-    from conftest import RAW_FS, _trace
-
-    offsets = offsets or {}
-    raw_dir = tmp_path / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    traces = []
-    for c in channels:
-        shift = offsets.get(c, 0.0)
-        npts = int((seconds - shift) * RAW_FS)
-        t = np.arange(npts) / RAW_FS
-        data = 1000.0 * np.sin(2 * np.pi * 0.5 * t)
-        traces.append(_trace(c, data, UTCDateTime(start) + shift))
-    path = raw_dir / name
-    Stream(traces).write(str(path), format="MSEED")
-    return path
-
-
-def test_process_skips_sliver_that_another_file_owns(preprocess_cfg, tmp_path):
-    """Real day files overhang midnight by a second or two. That sliver is an
-    hour the neighbouring day's file writes in full, to the identical path, so
-    writing it races the file that actually owns the hour."""
-    path = _mseed(tmp_path, "XX_TEST__24012020_000000_edge.mseed",
-                  "2020-01-23T23:59:58", 7202.0)
-    count, report = _process_single_mseed(preprocess_cfg, path,
-                                          preprocess_cfg.DATA_ROOT)
-
-    days = {p.parent.parent.name for p in _csvs(preprocess_cfg.DATA_ROOT)}
-    assert days == {"2020_01_24"}, "the 2 s sliver of the 23rd must be dropped"
-    assert count == 2 * 3
-    assert any("SKIP" in line for line in report), "the skip must be logged"
-
-
-def test_process_keeps_substantial_partial_hour(preprocess_cfg, tmp_path):
-    """A genuinely partial final hour is real data, not a boundary artefact:
-    it is kept, padded to the full hour with NaN so the grid stays aligned."""
-    path = _mseed(tmp_path, "XX_TEST__24012020_000000_half.mseed",
-                  "2020-01-24T00:00:00", 3600.0 + 1800.0)
-    count, _ = _process_single_mseed(preprocess_cfg, path,
-                                     preprocess_cfg.DATA_ROOT)
-    assert count == 2 * 3
-
-    data = np.loadtxt(
-        preprocess_cfg.DATA_ROOT / "2020_01_24" / "N" / "20200124_010000_N.csv",
-        delimiter=",",
+    factor = int(RAW_FS / preprocess_cfg.Fs)
+    expected = reference[::factor][:len(got)]
+    seam = len(unpadded[0])
+    near_seam = np.max(
+        np.abs(got[seam - 50:seam + 50] - expected[seam - 50:seam + 50])
+    ) / np.std(expected)
+    assert near_seam > 0.05, (
+        "expected an unpadded seam to be visibly wrong; if this fails, the "
+        "padding test above is no longer proving anything"
     )
-    assert len(data) == 3600 * preprocess_cfg.Fs
-    half = int(1800 * preprocess_cfg.Fs)
-    assert not np.isnan(data[:half - 10]).all(), "first half hour is real data"
-    assert np.isnan(data[half + 10:]).all(), "second half hour must be NaN"
 
 
-def test_process_partial_window_keeps_channels_aligned(preprocess_cfg,
-                                                       tmp_path):
-    """Regression: channels start a second or two apart, so a partial window
-    gave each one a different length -- and shunted a late-starting channel's
-    samples to the top of the hour, as if it had started on time."""
-    path = _mseed(tmp_path, "XX_TEST__24012020_000000_skew.mseed",
-                  "2020-01-24T00:00:00", 5400.0,
-                  offsets={"E": 0.0, "N": 120.0, "Z": 240.0})
-    _process_single_mseed(preprocess_cfg, path, preprocess_cfg.DATA_ROOT)
+def test_gap_report_ignores_the_padding_seams(preprocess_cfg, mseed_factory):
+    """Reading a file together with its neighbours makes the joins between
+    them look like gaps. They belong to no file and must not be reported as
+    this one's, or every clean file grows phantom gaps."""
+    files = [
+        mseed_factory(f"seam{i}.mseed", i * 3600, 3600.0, seed=i)
+        for i in range(3)
+    ]
+    _, _, report = preprocess_file(preprocess_cfg, files[1], files[0], files[2])
+    assert "0 small" in report[0] and "0 large" in report[0]
 
-    day = preprocess_cfg.DATA_ROOT / "2020_01_24"
-    per_channel = {
-        c: np.loadtxt(day / c / f"20200124_000000_{c}.csv", delimiter=",")
-        for c in ("E", "N", "Z")
-    }
-    assert len({len(a) for a in per_channel.values()}) == 1
 
-    # Each channel's NaN head must match how late it started, to the sample.
-    for channel, late_sec in (("E", 0.0), ("N", 120.0), ("Z", 240.0)):
-        data = per_channel[channel]
-        leading = int(np.argmax(~np.isnan(data))) if np.isnan(data[0]) else 0
-        assert leading == pytest.approx(
-            late_sec * preprocess_cfg.Fs, abs=1
-        ), f"{channel} samples sit at the wrong offset in the hour"
+def test_gap_report_still_sees_the_file_s_own_gaps(preprocess_cfg,
+                                                   mseed_factory):
+    """The complement: filtering out seams must not filter out real gaps."""
+    files = [
+        mseed_factory("own0.mseed", 0, 3600.0, seed=0),
+        mseed_factory("own1.mseed", 3600, 3600.0, seed=1, gap=(1800.0, 30.0)),
+        mseed_factory("own2.mseed", 7200, 3600.0, seed=2),
+    ]
+    _, _, report = preprocess_file(preprocess_cfg, files[1], files[0], files[2])
+    assert "3 large" in report[0]
