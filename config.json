@@ -10,11 +10,38 @@
     "raw_dir": "raw",
     "results_dir": "results",
     "results_subdir": "ENZ",
-    "cache_dir": "cache"
+    "cache_dir": "cache",
+    "data_dir": "data",
+    "data_pattern": "*_{station}_*.mseed",
+    "catalog": "catalog_current.csv",
+    "station_coords": "station_coords.csv"
+  },
+
+  "target": {
+    "start_date": null,
+    "duration_days": 7,
+    "quiet_window": false
+  },
+
+  "quiet_window": {
+    "samples": 15,
+    "min_mag": 3.0,
+    "max_dist_km": 300,
+    "seed": 0
   },
 
   "cache": {
     "enabled": false
+  },
+
+  "mean_period_estimation": {
+    "options": {
+      "max_dist_km": 300,
+      "dayfirst": true,
+      "catalog_utc_offset": 0,
+      "chunks": 20,
+      "jobs": 4
+    }
   },
 
   "preprocessing": {
@@ -45,7 +72,7 @@
         "tau": 5,
         "m": 5,
         "slope": [0, 1, 4, 10],
-        "mean_period": 1.0
+        "mean_period": null
       },
       "sample_entropy": {
         "m": 2,

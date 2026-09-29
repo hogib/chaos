@@ -317,6 +317,22 @@ def preprocess_file(cfg, mseed_file, pad_before=None, pad_after=None):
             # edge, never correctness of the rest; the gap report notes it.
             pass
 
+    return _process_stream(cfg, st_full, own_start, own_end, mseed_file.name)
+
+
+def _process_stream(cfg, st_full, own_start, own_end, label):
+    """Gap handling, filtering and decimation shared by files and pieces.
+
+    Args:
+        cfg: Configuration object.
+        st_full: Stream holding the span plus its filter padding.
+        own_start: First instant the result should cover.
+        own_end: Last instant the result should cover.
+        label: Name used in the gap report.
+
+    Returns:
+        Tuple ``(start_index, {channel: ndarray}, gap_report_lines)``.
+    """
     for tr in st_full:
         if tr.data.dtype != np.float64:
             tr.data = tr.data.astype(np.float64)
@@ -345,7 +361,7 @@ def preprocess_file(cfg, mseed_file, pad_before=None, pad_after=None):
     own_large = [g for g in large_gaps if own(g)]
 
     gap_report = [
-        f"{mseed_file.name}: {len(own_small)} small (<{cfg.GAP_THRESHOLD}s), "
+        f"{label}: {len(own_small)} small (<{cfg.GAP_THRESHOLD}s), "
         f"{len(own_large)} large (>={cfg.GAP_THRESHOLD}s)"
     ]
     for gap in own_large:
@@ -396,6 +412,66 @@ def preprocess_file(cfg, mseed_file, pad_before=None, pad_after=None):
         channels[component] = out
 
     return start_index, channels, gap_report
+
+
+def preprocess_piece(cfg, piece):
+    """Turns one :class:`chaos.recording.Piece` into decimated samples.
+
+    Only ``[piece.t0, piece.t1)`` plus the filter padding is read from the
+    files the piece overlaps, so a period can be cut out of files far larger
+    than memory. Neighbouring pieces tile the grid exactly: the last grid
+    sample of one is the sample just before the first of the next.
+
+    Args:
+        cfg: Configuration object.
+        piece: The span to process and the files that cover it.
+
+    Returns:
+        Tuple ``(start_index, {channel: ndarray}, gap_report_lines)``, or
+        ``None`` when the files hold nothing inside the span.
+    """
+    pad = filter_pad_sec(cfg)
+    lo, hi = piece.t0 - pad, piece.t1 + pad
+
+    st_full = None
+    for path in piece.files:
+        try:
+            part = read(str(path), starttime=lo, endtime=hi)
+        except Exception:
+            continue
+        st_full = part if st_full is None else st_full + part
+    if st_full is None or len(st_full) == 0:
+        return None
+    wanted = set(cfg.PREPROCESS_CHANNELS)
+    st_full = st_full.__class__(
+        [tr for tr in st_full if tr.stats.channel[-1:] in wanted]
+    ) or st_full
+
+    data_start = min(tr.stats.starttime for tr in st_full)
+    data_end = max(tr.stats.endtime for tr in st_full)
+    own_start = max(piece.t0, data_start)
+    # Stop just short of t1 so the next piece owns the grid sample at t1.
+    own_end = min(piece.t1 - 1e-6, data_end)
+    if own_end <= own_start:
+        return None
+    return _process_stream(cfg, st_full, own_start, own_end, piece.name)
+
+
+def preprocess_piece_task(args):
+    """Pickle-friendly wrapper around :func:`preprocess_piece`.
+
+    Args:
+        args: Tuple ``(cfg, piece)``.
+
+    Returns:
+        Tuple ``(piece_name, start_index, channels, gap_report_lines)``, or
+        ``None`` when the piece holds no data.
+    """
+    cfg, piece = args
+    result = preprocess_piece(cfg, piece)
+    if result is None:
+        return None
+    return (piece.name, *result)
 
 
 def preprocess_file_task(args):

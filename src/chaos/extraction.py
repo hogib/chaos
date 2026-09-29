@@ -9,8 +9,9 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
-from chaos.preprocess import grid_time
-from chaos.recording import RollingBuffer, iter_blocks
+from chaos.preprocess import filter_pad_sec, grid_time
+from chaos.recording import (RollingBuffer, file_spans, iter_blocks,
+                             iter_piece_blocks, plan_pieces)
 
 from chaos.chaotic_features import (compute_corr_dim,
                                     compute_lyapunov_rosenstein,
@@ -190,16 +191,35 @@ def run_feature_extraction(cfg) -> bool:
     print("=" * 50)
 
     channels = list(cfg.CHANNELS)
-    mseed_files = sorted(cfg.MSEED_INPUT_DIR.glob("*.mseed"))
+    period = getattr(cfg, "PERIOD", None)
+    pattern = getattr(cfg, "DATA_PATTERN", "*.mseed")
+    mseed_files = sorted(cfg.MSEED_INPUT_DIR.glob(pattern))
     if not mseed_files:
-        print(f"[SKIPPED] No .mseed files found in: {cfg.MSEED_INPUT_DIR}")
+        print(f"[SKIPPED] No {pattern} files found in: {cfg.MSEED_INPUT_DIR}")
         return False
+
+    if period is not None:
+        spans, unreadable = file_spans(mseed_files)
+        for name in unreadable:
+            print(f"  [WARN] skipping unreadable file: {name}")
+        pieces = plan_pieces(spans, period.t0, period.t1, filter_pad_sec(cfg))
+        mseed_files = sorted({f for piece in pieces for f in piece.files})
+        if not pieces:
+            print(f"[SKIPPED] No data between {period.t0} and {period.t1} in "
+                  f"{cfg.MSEED_INPUT_DIR}")
+            return False
+        blocks = iter_piece_blocks(cfg, pieces)
+    else:
+        blocks = iter_blocks(cfg, mseed_files)
 
     print(f"Station   : {cfg.STATION} | Channels: {', '.join(channels)}")
     print(f"Window    : {cfg.WIN_SEC}s  | Step: {cfg.STEP_SEC}s  | Fs: {cfg.Fs} Hz")
+    if period is not None:
+        print(f"Period    : {period.t0} -> {period.t1} ({len(pieces)} piece(s) of up to a day)")
     print(f"Files     : {len(mseed_files)}")
 
-    out_path = cfg.OUTPUT_ROOT / f"{cfg.STATION}_{cfg.EARTHQUAKE_NAME}_features.csv"
+    run_name = getattr(cfg, "RUN_NAME", cfg.EARTHQUAKE_NAME)
+    out_path = cfg.OUTPUT_ROOT / f"{cfg.STATION}_{run_name}_features.csv"
     namer = _WindowNamer()
     buffer = RollingBuffer(channels, cfg.WinSize, cfg.StepSize)
 
@@ -236,7 +256,7 @@ def run_feature_extraction(cfg) -> bool:
                 first_write = _flush(rows, out_path, first_write)
                 rows = []
 
-        for block in iter_blocks(cfg, mseed_files):
+        for block in blocks:
             gap_lines.extend(block.gap_report)
             # A block that does not continue the previous one restarts the
             # window grid at its own first sample; the buffer detects that and

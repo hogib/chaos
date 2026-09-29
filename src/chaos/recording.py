@@ -11,12 +11,20 @@ year would not fit. Yielding blocks keeps memory flat in the length of the run.
 
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+from obspy import UTCDateTime, read
 
 from chaos.cache import cache_key, load_block, store_block
-from chaos.preprocess import (_resolve_workers, grid_time, preprocess_file,
-                              preprocess_file_task, sort_by_start_time)
+from chaos.preprocess import (_resolve_workers, grid_time,
+                              preprocess_file_task, preprocess_piece_task,
+                              sort_by_start_time)
+
+# A day of three 100 Hz channels is ~200 MB decoded, a comfortable amount for
+# each worker to hold; the source files themselves may span weeks.
+PIECE_SEC = 86400.0
 
 
 @dataclass
@@ -46,6 +54,97 @@ class Block:
     def start_time(self, fs: float):
         """Returns the :class:`obspy.UTCDateTime` of sample 0."""
         return grid_time(self.start_index, fs)
+
+
+@dataclass(frozen=True)
+class Piece:
+    """One span of a target period together with the files that cover it.
+
+    Pieces stand in for files when the recording is cut out of long
+    continuous files by date. They quack like a path where the block cache
+    needs one (``name``, ``stem``, ``stat()``), so cached entries are tied to
+    the span and to the files it was read from.
+
+    Attributes:
+        t0: Start of the span (:class:`obspy.UTCDateTime`).
+        t1: End of the span, exclusive.
+        files: MSEED paths overlapping the span or its filter padding.
+    """
+
+    t0: UTCDateTime
+    t1: UTCDateTime
+    files: tuple
+
+    @property
+    def name(self) -> str:
+        return f"{self.t0.strftime('%Y%m%dT%H%M%S')}-{self.t1.strftime('%Y%m%dT%H%M%S')}"
+
+    @property
+    def stem(self) -> str:
+        return self.name
+
+    def __hash__(self):
+        return hash((float(self.t0), float(self.t1), self.files))
+
+    def stat(self):
+        """Combined size and newest mtime of the source files."""
+        stats = [Path(f).stat() for f in self.files]
+        return SimpleNamespace(st_size=sum(st.st_size for st in stats),
+                               st_mtime=max(st.st_mtime for st in stats))
+
+
+def file_spans(mseed_files):
+    """Returns ``(start, end, path)`` from each readable file header, by start.
+
+    Args:
+        mseed_files: Paths to inspect.
+
+    Returns:
+        Tuple ``(spans, unreadable_names)``.
+    """
+    spans, unreadable = [], []
+    for path in mseed_files:
+        try:
+            st = read(str(path), headonly=True)
+        except Exception:
+            unreadable.append(Path(path).name)
+            continue
+        if len(st):
+            spans.append((min(tr.stats.starttime for tr in st),
+                          max(tr.stats.endtime for tr in st), Path(path)))
+    spans.sort(key=lambda s: s[0])
+    return spans, unreadable
+
+
+def plan_pieces(spans, t0, t1, pad_sec, piece_sec=PIECE_SEC):
+    """Cuts ``[t0, t1)`` into pieces, each listing the files it needs.
+
+    Pieces start on multiples of ``piece_sec`` from the epoch (UTC midnights
+    for day pieces), so a period's pieces line up with another period's and
+    the block cache can share them. Pieces no file overlaps are left out.
+
+    Args:
+        spans: ``(start, end, path)`` tuples from :func:`file_spans`.
+        t0: Period start.
+        t1: Period end, exclusive.
+        pad_sec: Filter padding each piece reads either side.
+        piece_sec: Piece length in seconds.
+
+    Returns:
+        A list of :class:`Piece`, in time order.
+    """
+    t0, t1 = UTCDateTime(t0), UTCDateTime(t1)
+    pieces = []
+    a = UTCDateTime(np.floor(float(t0) / piece_sec) * piece_sec)
+    while a < t1:
+        lo, hi = max(a, t0), min(a + piece_sec, t1)
+        files = tuple(path for s, e, path in spans
+                      if e >= lo - pad_sec and s <= hi + pad_sec)
+        own = any(e > lo and s < hi for s, e, _ in spans)
+        if files and own:
+            pieces.append(Piece(lo, hi, files))
+        a += piece_sec
+    return pieces
 
 
 def _merge_into(target: Block, start_index: int, data: dict) -> None:
@@ -109,15 +208,39 @@ def iter_blocks(cfg, mseed_files):
     if not mseed_files:
         return
 
-    max_gap_samples = int(round(cfg.MAX_GAP_SEC * cfg.Fs))
     workers = _resolve_workers(cfg, len(mseed_files))
     key = cache_key(cfg) if cfg.CACHE_ENABLED else None
+    results = _stream(cfg, mseed_files, workers, key,
+                      preprocess_file_task,
+                      lambda i: _task_args(cfg, mseed_files, i))
+    yield from _stitch(cfg, results)
 
+
+def iter_piece_blocks(cfg, pieces):
+    """Like :func:`iter_blocks`, for pieces cut out of longer files.
+
+    Args:
+        cfg: Configuration object.
+        pieces: :class:`Piece` list in time order (see :func:`plan_pieces`).
+
+    Yields:
+        :class:`Block` instances in increasing time order.
+    """
+    if not pieces:
+        return
+    workers = _resolve_workers(cfg, len(pieces))
+    key = cache_key(cfg) if cfg.CACHE_ENABLED else None
+    results = _stream(cfg, pieces, workers, key, preprocess_piece_task,
+                      lambda i: (cfg, pieces[i]))
+    yield from _stitch(cfg, (r for r in results if r is not None))
+
+
+def _stitch(cfg, results):
+    """Joins per-source results into contiguous blocks (see iter_blocks)."""
+    max_gap_samples = int(round(cfg.MAX_GAP_SEC * cfg.Fs))
     pending: Block | None = None
 
-    for name, start_index, data, report in _stream_files(
-        cfg, mseed_files, workers, key
-    ):
+    for name, start_index, data, report in results:
         print(f"  [READ] {name}: {report[0].split(': ', 1)[-1]}")
 
         if pending is None:
@@ -133,7 +256,7 @@ def iter_blocks(cfg, mseed_files):
         pending.gap_report.extend(report)
         pending = _extend(pending, start_index, data, cfg.Fs)
 
-        # Files arrive in order of start time, so nothing still to come can
+        # Sources arrive in order of start time, so nothing still to come can
         # begin before this one did: everything earlier than start_index is
         # settled and can go downstream now. Without this the whole recording
         # would accumulate in one block, which is exactly what streaming is
@@ -175,28 +298,38 @@ def _split(block: Block, at_index: int):
     return head, tail
 
 
-def _stream_files(cfg, mseed_files, workers, key):
-    """Preprocesses files in parallel, yielding results in file order.
+def _stream(cfg, sources, workers, key, task, task_args):
+    """Preprocesses sources in parallel, yielding results in source order.
 
-    At most ``2 * workers`` files are in flight, which bounds how much decoded
-    waveform is resident at once regardless of how many files there are.
+    At most ``workers + 2`` sources are in flight, which bounds how much
+    decoded waveform is resident at once regardless of how many there are.
 
     Args:
         cfg: Configuration object.
-        mseed_files: Sorted list of MSEED paths.
+        sources: Sorted MSEED paths or :class:`Piece` objects.
         workers: Process pool size.
         key: Cache key, or ``None`` when caching is off.
+        task: Pickle-friendly function run on ``task_args(i)``; returns
+            ``(name, start_index, channels, gap_report_lines)`` or ``None``.
+        task_args: Builds the argument tuple for source ``i``.
 
     Yields:
-        Tuple ``(file_name, start_index, channels, gap_report_lines)``.
+        Whatever ``task`` returns, one per source, in order.
     """
     if workers == 1:
-        for i, path in enumerate(mseed_files):
-            yield _one_file(cfg, mseed_files, i, key)
+        for i in range(len(sources)):
+            cached = _cached(cfg, sources, i, key)
+            if cached is not None:
+                yield cached
+                continue
+            result = task(task_args(i))
+            if key is not None and result is not None:
+                store_block(cfg, key, sources[i], result)
+            yield result
         return
 
     in_flight: dict[int, object] = {}
-    # Each finished file sits in memory until the consumer reaches it, and a
+    # Each finished source sits in memory until the consumer reaches it, and a
     # day of three channels is ~10 MB, so the lookahead is what really sets
     # peak memory. A couple more than the worker count keeps everyone busy
     # without hoarding a queue of decoded waveform nobody is ready for.
@@ -204,23 +337,21 @@ def _stream_files(cfg, mseed_files, workers, key):
 
     with ProcessPoolExecutor(max_workers=workers) as ex:
         next_to_submit = 0
-        for i in range(len(mseed_files)):
-            while next_to_submit < len(mseed_files) and \
+        for i in range(len(sources)):
+            while next_to_submit < len(sources) and \
                     next_to_submit < i + ahead:
                 j = next_to_submit
-                cached = _cached(cfg, mseed_files, j, key)
+                cached = _cached(cfg, sources, j, key)
                 if cached is not None:
-                    in_flight[j] = cached
+                    in_flight[j] = ("cached", cached)
                 else:
-                    in_flight[j] = ex.submit(
-                        preprocess_file_task, _task_args(cfg, mseed_files, j)
-                    )
+                    in_flight[j] = ("future", ex.submit(task, task_args(j)))
                 next_to_submit += 1
 
-            slot = in_flight.pop(i)
-            result = slot if isinstance(slot, tuple) else slot.result()
-            if key is not None and not isinstance(slot, tuple):
-                store_block(cfg, key, mseed_files[i], result)
+            kind, slot = in_flight.pop(i)
+            result = slot if kind == "cached" else slot.result()
+            if key is not None and kind == "future" and result is not None:
+                store_block(cfg, key, sources[i], result)
             yield result
 
 
@@ -234,25 +365,11 @@ def _task_args(cfg, mseed_files, i):
     )
 
 
-def _cached(cfg, mseed_files, i, key):
-    """Returns a cached result for file ``i``, or ``None`` on a miss."""
+def _cached(cfg, sources, i, key):
+    """Returns a cached result for source ``i``, or ``None`` on a miss."""
     if key is None:
         return None
-    return load_block(cfg, key, mseed_files[i])
-
-
-def _one_file(cfg, mseed_files, i, key):
-    """Serial path: cache lookup, otherwise preprocess and store."""
-    cached = _cached(cfg, mseed_files, i, key)
-    if cached is not None:
-        return cached
-
-    _, path, pad_before, pad_after = _task_args(cfg, mseed_files, i)
-    start_index, data, report = preprocess_file(cfg, path, pad_before, pad_after)
-    result = (path.name, start_index, data, report)
-    if key is not None:
-        store_block(cfg, key, path, result)
-    return result
+    return load_block(cfg, key, sources[i])
 
 
 class RollingBuffer:

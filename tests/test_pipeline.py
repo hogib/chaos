@@ -204,13 +204,17 @@ def test_shipped_config_rosenstein_window_is_usable():
     real = load_config()
     fe = real["feature_extraction"]
     ros = fe["features"]["rosenstein"]
+    # An estimated mean period cannot come out shorter than one period of the
+    # passband's upper corner, so that is the worst case to check against.
+    mean_period = ros.get("mean_period") or \
+        1.0 / real["preprocessing"]["freq_max"]
 
     for label, window in zip(("short", "long"),
                              split_slope_windows(ros["slope"])):
         if window is None:
             continue
-        lo = round(window[0] * ros["mean_period"] * fe["fs"])
-        hi = round(window[1] * ros["mean_period"] * fe["fs"])
+        lo = round(window[0] * mean_period * fe["fs"])
+        hi = round(window[1] * mean_period * fe["fs"])
         assert hi - lo + 1 >= MIN_FIT_POINTS, (
             f"{label} fit window {window} spans {hi - lo + 1} samples at "
             f"fs={fe['fs']}; a line through <{MIN_FIT_POINTS} points always "
